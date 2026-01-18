@@ -28,11 +28,11 @@ import { Source } from "./SourceBubble";
 import { apiBaseUrl } from "../utils/constants";
 
 const MODEL_TYPES = [
-  "openai_gpt_3_5_turbo",
-  "anthropic_claude_3_haiku",
-  "google_gemini_pro",
-  "fireworks_mixtral",
-  "cohere_command",
+  "xiaomi_mimo_v2_flash",
+  "deepseek_r1",
+  "mistralai_devstral",
+  "deepseek_r1t2_chimera",
+  "glm_4_5_air",
 ];
 
 const defaultLlmValue =
@@ -48,7 +48,7 @@ export function ChatWindow(props: { conversationId: string }) {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [llm, setLlm] = useState(
-    searchParams.get("llm") ?? "openai_gpt_3_5_turbo",
+    searchParams.get("llm") ?? "xiaomi_mimo_v2_flash",
   );
   const [llmIsLoading, setLlmIsLoading] = useState(true);
   useEffect(() => {
@@ -111,7 +111,7 @@ export function ChatWindow(props: { conversationId: string }) {
           timeout: 60000,
         },
       });
-      const llmDisplayName = llm ?? "openai_gpt_3_5_turbo";
+      const llmDisplayName = llm ?? "xiaomi_mimo_v2_flash";
       const streamLog = await remoteChain.streamLog(
         {
           question: messageValue,
@@ -254,13 +254,11 @@ export function ChatWindow(props: { conversationId: string }) {
                 }}
                 width={"240px"}
               >
-                <option value="openai_gpt_3_5_turbo">GPT-3.5-Turbo</option>
-                <option value="anthropic_claude_3_haiku">Claude 3 Haiku</option>
-                <option value="google_gemini_pro">Google Gemini Pro</option>
-                <option value="fireworks_mixtral">
-                  Mixtral (via Fireworks.ai)
-                </option>
-                <option value="cohere_command">Cohere</option>
+                <option value="xiaomi_mimo_v2_flash">Xiaomi Mimo V2 Flash (Free)</option>
+                <option value="deepseek_r1">DeepSeek R1 (Free)</option>
+                <option value="mistralai_devstral">Mistral Devstral (Free)</option>
+                <option value="deepseek_r1t2_chimera">DeepSeek R1T2 Chimera (Free)</option>
+                <option value="glm_4_5_air">GLM 4.5 Air (Free)</option>
               </Select>
             )}
           </div>

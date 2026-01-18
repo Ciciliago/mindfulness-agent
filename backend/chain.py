@@ -221,11 +221,11 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     response_synthesizer = (
         default_response_synthesizer.configurable_alternatives(
             ConfigurableField("llm"),
-            default_key="openai_gpt_3_5_turbo",
-            anthropic_claude_3_haiku=default_response_synthesizer,
-            fireworks_mixtral=default_response_synthesizer,
-            google_gemini_pro=default_response_synthesizer,
-            cohere_command=cohere_response_synthesizer,
+            default_key="xiaomi_mimo_v2_flash",
+            deepseek_r1=default_response_synthesizer,
+            mistralai_devstral=default_response_synthesizer,
+            deepseek_r1t2_chimera=default_response_synthesizer,
+            glm_4_5_air=default_response_synthesizer,
         )
         | StrOutputParser()
     ).with_config(run_name="GenerateResponse")
@@ -237,47 +237,51 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
 
 
 gpt_3_5 = ChatOpenAI(
-    model="gpt-3.5-turbo",
+    model="xiaomi/mimo-v2-flash:free",
     temperature=0,
     streaming=True,
-    openai_api_key=os.getenv("API_SECRET_KEY"),
-    openai_api_base="https://api.zhizengzeng.com/v1/"
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
 )
-claude_3_haiku = ChatAnthropic(
-    model="claude-3-haiku-20240307",
+deepseek_r1 = ChatOpenAI(
+    model="deepseek/deepseek-r1-0528:free",
     temperature=0,
-    max_tokens=4096,
-    anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", "not_provided"),
+    streaming=True,
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
 )
-fireworks_mixtral = ChatFireworks(
-    model="accounts/fireworks/models/mixtral-8x7b-instruct",
+devstral = ChatOpenAI(
+    model="mistralai/devstral-2512:free",
     temperature=0,
-    max_tokens=16384,
-    fireworks_api_key=os.environ.get("FIREWORKS_API_KEY", "not_provided"),
+    streaming=True,
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
 )
-gemini_pro = ChatGoogleGenerativeAI(
-    model="gemini-pro",
+chimera = ChatOpenAI(
+    model="tngtech/deepseek-r1t2-chimera:free",
     temperature=0,
-    max_tokens=16384,
-    convert_system_message_to_human=True,
-    google_api_key=os.environ.get("GOOGLE_API_KEY", "not_provided"),
+    streaming=True,
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
 )
-cohere_command = ChatCohere(
-    model="command",
+glm_4 = ChatOpenAI(
+    model="z-ai/glm-4.5-air:free",
     temperature=0,
-    cohere_api_key=os.environ.get("COHERE_API_KEY", "not_provided"),
+    streaming=True,
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1"
 )
 llm = gpt_3_5.configurable_alternatives(
     # This gives this field an id
     # When configuring the end runnable, we can then use this id to configure this field
     ConfigurableField(id="llm"),
-    default_key="openai_gpt_3_5_turbo",
-    anthropic_claude_3_haiku=claude_3_haiku,
-    fireworks_mixtral=fireworks_mixtral,
-    google_gemini_pro=gemini_pro,
-    cohere_command=cohere_command,
+    default_key="xiaomi_mimo_v2_flash",
+    deepseek_r1=deepseek_r1,
+    mistralai_devstral=devstral,
+    deepseek_r1t2_chimera=chimera,
+    glm_4_5_air=glm_4,
 ).with_fallbacks(
-    [gpt_3_5, claude_3_haiku, fireworks_mixtral, gemini_pro, cohere_command]
+    [deepseek_r1, devstral, chimera, glm_4]
 )
 
 retriever = get_retriever()

@@ -7,7 +7,7 @@ from backend.parser import langchain_docs_extractor
 import weaviate
 from bs4 import BeautifulSoup, SoupStrainer
 from backend.constants import WEAVIATE_DOCS_INDEX_NAME
-from langchain_community.document_loaders import RecursiveUrlLoader, SitemapLoader
+from langchain_community.document_loaders import RecursiveUrlLoader, SitemapLoader, DirectoryLoader, TextLoader
 from langchain.indexes import SQLRecordManager, index
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.utils.html import PREFIXES_TO_IGNORE_REGEX, SUFFIXES_TO_IGNORE_REGEX
@@ -106,6 +106,19 @@ def load_api_docs():
     ).load()
 
 
+def load_markdown_docs():
+    """从 documents 目录加载 Markdown 文件"""
+    documents_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "documents")
+    loader = DirectoryLoader(
+        documents_path,
+        glob="**/*.md",
+        loader_cls=TextLoader,
+        loader_kwargs={"encoding": "utf-8"},
+        show_progress=True
+    )
+    return loader.load()
+
+
 def ingest_docs():
     WEAVIATE_URL = os.environ["WEAVIATE_URL"]
     WEAVIATE_API_KEY = os.environ["WEAVIATE_API_KEY"]
@@ -135,14 +148,16 @@ def ingest_docs():
 
     # docs_from_documentation = load_langchain_docs()
     # logger.info(f"Loaded {len(docs_from_documentation)} docs from documentation")
-    docs_from_api = load_api_docs()
-    logger.info(f"Loaded {len(docs_from_api)} docs from API")
+    # docs_from_api = load_api_docs()
+    # logger.info(f"Loaded {len(docs_from_api)} docs from API")
+    docs_from_markdown = load_markdown_docs()
+    logger.info(f"Loaded {len(docs_from_markdown)} docs from Markdown files")
     # docs_from_langsmith = load_langsmith_docs()
     # logger.info(f"Loaded {len(docs_from_langsmith)} docs from Langsmith")
 
     docs_transformed = text_splitter.split_documents(
         # docs_from_documentation + docs_from_api + docs_from_langsmith
-        docs_from_api
+        docs_from_markdown
     )
     docs_transformed = [doc for doc in docs_transformed if len(doc.page_content) > 10]
 
