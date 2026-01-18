@@ -256,7 +256,8 @@ export function ChatMessageBubble(props: {
 
   return (
     <VStack align="start" spacing={5} pb={5}>
-      {!isUser && filteredSources.length > 0 && (
+      {/* Sources 已隐藏 */}
+      {false && !isUser && filteredSources.length > 0 && (
         <>
           <Flex direction={"column"} width={"100%"}>
             <VStack spacing={"5px"} align={"start"} width={"100%"}>
