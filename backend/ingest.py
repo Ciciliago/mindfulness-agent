@@ -2,11 +2,11 @@
 import logging
 import os
 import re
-from parser import langchain_docs_extractor
+from backend.parser import langchain_docs_extractor
 
 import weaviate
 from bs4 import BeautifulSoup, SoupStrainer
-from constants import WEAVIATE_DOCS_INDEX_NAME
+from backend.constants import WEAVIATE_DOCS_INDEX_NAME
 from langchain_community.document_loaders import RecursiveUrlLoader, SitemapLoader
 from langchain.indexes import SQLRecordManager, index
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -19,8 +19,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# def get_embeddings_model() -> Embeddings:
+#     return OpenAIEmbeddings(model="text-embedding-3-small", chunk_size=200)
+
+
 def get_embeddings_model() -> Embeddings:
-    return OpenAIEmbeddings(model="text-embedding-3-small", chunk_size=200)
+    return OpenAIEmbeddings(
+        # 从.env文件读取知增增API密钥
+        openai_api_key=os.getenv("API_SECRET_KEY"),
+        # 知增增中转站的基础地址
+        openai_api_base="https://api.zhizengzeng.com/v1/",
+        # 兼容的嵌入模型名
+        model="text-embedding-ada-002",
+        chunk_size=200
+    )
 
 
 def metadata_extractor(meta: dict, soup: BeautifulSoup) -> dict:

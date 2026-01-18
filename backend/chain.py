@@ -3,10 +3,10 @@ from operator import itemgetter
 from typing import Dict, List, Optional, Sequence
 
 import weaviate
-from constants import WEAVIATE_DOCS_INDEX_NAME
+from backend.constants import WEAVIATE_DOCS_INDEX_NAME
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from ingest import get_embeddings_model
+from backend.ingest import get_embeddings_model
 from langchain_anthropic import ChatAnthropic
 from langchain_community.chat_models import ChatCohere
 from langchain_community.vectorstores import Weaviate
@@ -236,7 +236,13 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     )
 
 
-gpt_3_5 = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0, streaming=True)
+gpt_3_5 = ChatOpenAI(
+    model="gpt-3.5-turbo",
+    temperature=0,
+    streaming=True,
+    openai_api_key=os.getenv("API_SECRET_KEY"),
+    openai_api_base="https://api.zhizengzeng.com/v1/"
+)
 claude_3_haiku = ChatAnthropic(
     model="claude-3-haiku-20240307",
     temperature=0,
