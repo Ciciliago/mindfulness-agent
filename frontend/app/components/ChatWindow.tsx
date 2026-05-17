@@ -184,7 +184,12 @@ export function ChatWindow(props: { conversationId: string }) {
       setMessages((prevMessages) => prevMessages.slice(0, -1));
       setIsLoading(false);
       setInput(messageValue);
-      throw e;
+      const isAbort =
+        e instanceof Error &&
+        (e.name === "AbortError" || e.message.toLowerCase().includes("aborted"));
+      if (!isAbort) {
+        throw e;
+      }
     }
   };
 

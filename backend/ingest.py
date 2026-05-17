@@ -29,8 +29,8 @@ def get_embeddings_model() -> Embeddings:
         openai_api_key=os.getenv("API_SECRET_KEY"),
         # 知增增中转站的基础地址
         openai_api_base="https://api.zhizengzeng.com/v1/",
-        # 兼容的嵌入模型名
-        model="text-embedding-ada-002",
+        # 1536维，和语义chunk重建后的向量库保持一致
+        model="text-embedding-3-small",
         chunk_size=200
     )
 
@@ -130,6 +130,7 @@ def ingest_docs():
     client = weaviate.Client(
         url=WEAVIATE_URL,
         auth_client_secret=weaviate.AuthApiKey(api_key=WEAVIATE_API_KEY),
+        startup_period=None,
     )
     print("aaaaa:",client.is_ready())
     vectorstore = Weaviate(

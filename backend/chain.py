@@ -1,4 +1,5 @@
 import os
+import logging
 from operator import itemgetter
 from typing import Dict, List, Optional, Sequence
 
@@ -34,6 +35,8 @@ from langchain_fireworks import ChatFireworks
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langsmith import Client
+
+logger = logging.getLogger(__name__)
 
 RESPONSE_TEMPLATE = """\
 You are an expert programmer and problem-solver, tasked with answering any question \
@@ -126,20 +129,33 @@ class ChatRequest(BaseModel):
     chat_history: Optional[List[Dict[str, str]]]
 
 
+class EmptyRetriever(BaseRetriever):
+    def _get_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+        return []
+
+    async def _aget_relevant_documents(self, query: str, *, run_manager=None) -> List[Document]:
+        return []
+
+
 def get_retriever() -> BaseRetriever:
-    weaviate_client = weaviate.Client(
-        url=WEAVIATE_URL,
-        auth_client_secret=weaviate.AuthApiKey(api_key=WEAVIATE_API_KEY),
-    )
-    weaviate_client = Weaviate(
-        client=weaviate_client,
-        index_name=WEAVIATE_DOCS_INDEX_NAME,
-        text_key="text",
-        embedding=get_embeddings_model(),
-        by_text=False,
-        attributes=["source", "title"],
-    )
-    return weaviate_client.as_retriever(search_kwargs=dict(k=6))
+    try:
+        weaviate_client = weaviate.Client(
+            url=WEAVIATE_URL,
+            auth_client_secret=weaviate.AuthApiKey(api_key=WEAVIATE_API_KEY),
+            startup_period=None,
+        )
+        weaviate_client = Weaviate(
+            client=weaviate_client,
+            index_name=WEAVIATE_DOCS_INDEX_NAME,
+            text_key="text",
+            embedding=get_embeddings_model(),
+            by_text=False,
+            attributes=["source", "title"],
+        )
+        return weaviate_client.as_retriever(search_kwargs=dict(k=6))
+    except Exception as exc:
+        logger.exception("Failed to initialize Weaviate retriever; falling back to empty retriever: %s", exc)
+        return EmptyRetriever()
 
 
 def create_retriever_chain(
