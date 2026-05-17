@@ -174,6 +174,13 @@ export function ChatMessageBubble(props: {
     setIsLoading(false);
   };
   const viewTrace = async () => {
+    if (!runId) {
+      toast.error("Trace is unavailable for this message.");
+      return;
+    }
+
+    // Open a placeholder tab synchronously on click to avoid popup blockers.
+    const traceWindow = window.open("", "_blank");
     try {
       setTraceIsLoading(true);
       const response = await fetch(apiBaseUrl + "/get_trace", {
@@ -188,18 +195,40 @@ export function ChatMessageBubble(props: {
 
       const data = await response.json();
 
-      if (data.code === 400) {
-        toast.error("Unable to view trace");
+      if (!response.ok) {
+        throw new Error(
+          (typeof data?.message === "string" && data.message) ||
+            "Unable to view trace",
+        );
+      }
+
+      let rawUrl: string | undefined;
+      if (typeof data === "string") {
+        rawUrl = data;
+      } else if (typeof data?.url === "string") {
+        rawUrl = data.url;
+      } else if (typeof data?.result === "string") {
+        rawUrl = data.result;
+      }
+      if (!rawUrl) {
         throw new Error("Unable to view trace");
+      }
+
+      const url = rawUrl.replace(/['"]+/g, "");
+      if (traceWindow) {
+        traceWindow.location.href = url;
+        traceWindow.focus();
       } else {
-        const url = data.replace(/['"]+/g, "");
-        window.open(url, "_blank");
-        setTraceIsLoading(false);
+        window.location.href = url;
       }
     } catch (e: any) {
+      if (traceWindow && !traceWindow.closed) {
+        traceWindow.close();
+      }
       console.error("Error:", e);
-      setTraceIsLoading(false);
       toast.error(e.message);
+    } finally {
+      setTraceIsLoading(false);
     }
   };
 
@@ -352,12 +381,13 @@ export function ChatMessageBubble(props: {
             <Button
               size="sm"
               variant="outline"
-              colorScheme={runId === null ? "blue" : "gray"}
+              colorScheme={runId ? "blue" : "gray"}
               onClick={(e) => {
                 e.preventDefault();
                 viewTrace();
               }}
               isLoading={traceIsLoading}
+              isDisabled={!runId}
               loadingText="🔄"
               color="white"
             >
