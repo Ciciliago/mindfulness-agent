@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 Route = Literal["intervene", "simple_qa", "retrieval_qa", "script_gen"]
 RiskLevel = Literal["low", "medium", "high"]
+SafetyReason = Literal["none", "crisis", "dangerous_context"]
 
 
 @dataclass
@@ -21,6 +22,8 @@ class ScriptRequirements:
 class Skill1Decision:
     route: Route
     risk_level: RiskLevel = "low"
+    safety_reason: SafetyReason = "none"
+    negative_emotion: bool = False
     state_tags: List[str] = field(default_factory=list)
     energy_tags: List[str] = field(default_factory=list)
     script_requirements: ScriptRequirements = field(default_factory=ScriptRequirements)
@@ -51,6 +54,18 @@ MEDIUM_RISK_KEYWORDS = [
     "没有意义",
 ]
 
+DANGEROUS_CONTEXT_KEYWORDS = [
+    "正在开车",
+    "我在开车",
+    "开车中",
+    "驾驶中",
+    "高速上",
+    "骑车中",
+    "过马路",
+    "操作机器",
+    "高空作业",
+]
+
 SCRIPT_INTENT_KEYWORDS = [
     "正念引导语",
     "引导语脚本",
@@ -60,6 +75,12 @@ SCRIPT_INTENT_KEYWORDS = [
     "引导我冥想",
     "生成脚本",
     "做一段冥想",
+    "带我做冥想",
+    "带我练",
+    "来一段正念",
+    "来一段冥想",
+    "做个睡前冥想",
+    "放松练习",
 ]
 
 SIMPLE_QA_KEYWORDS = [
@@ -71,6 +92,12 @@ SIMPLE_QA_KEYWORDS = [
     "再见",
     "你是谁",
     "你能做什么",
+    "今天天气",
+    "天气不错",
+    "天气真好",
+    "早上好",
+    "晚上好",
+    "在吗",
 ]
 
 EMOTIONAL_SUPPORT_KEYWORDS = [
@@ -81,6 +108,7 @@ EMOTIONAL_SUPPORT_KEYWORDS = [
     "烦",
     "烦躁",
     "压力大",
+    "压力很大",
     "低落",
     "郁闷",
     "心累",
@@ -90,6 +118,20 @@ EMOTIONAL_SUPPORT_KEYWORDS = [
     "情绪很差",
     "很糟",
     "崩溃",
+]
+
+CHITCHAT_KEYWORDS = [
+    "今天天气",
+    "天气真好",
+    "天气不错",
+    "下雨了",
+    "吃了吗",
+    "早上好",
+    "晚上好",
+    "午安",
+    "晚安",
+    "在吗",
+    "哈哈",
 ]
 
 KNOWLEDGE_QUERY_HINTS = [
@@ -105,6 +147,15 @@ KNOWLEDGE_QUERY_HINTS = [
     "引用",
     "根据",
     "论文",
+    "科学依据",
+    "研究",
+    "为什么",
+    "怎么理解",
+    "介绍一下",
+    "有何区别",
+    "有什么区别",
+    "mbsr",
+    "mbct",
 ]
 
 CORE_GOAL_KEYWORDS = {
@@ -168,8 +219,28 @@ def detect_risk_level(text: str) -> RiskLevel:
     return "low"
 
 
+def detect_safety_reason(text: str) -> SafetyReason:
+    if _contains_any(text, HIGH_RISK_KEYWORDS):
+        return "crisis"
+    if _contains_any(text, DANGEROUS_CONTEXT_KEYWORDS):
+        return "dangerous_context"
+    return "none"
+
+
 def detect_script_intent(text: str) -> bool:
-    return _contains_any(text, SCRIPT_INTENT_KEYWORDS)
+    clean = _safe_strip(text)
+    if not clean:
+        return False
+    if _contains_any(clean, SCRIPT_INTENT_KEYWORDS):
+        return True
+    # Semantic practice request patterns, e.g. "我想做一段睡前冥想"
+    pattern = re.compile(
+        r"(我想|想|希望|请|帮我|带我|可以).{0,10}(做|来|进行|开始|练|试试).{0,12}(正念|冥想|练习)",
+        flags=re.IGNORECASE,
+    )
+    if pattern.search(clean):
+        return True
+    return False
 
 
 def detect_state_tags(text: str) -> List[str]:
@@ -420,6 +491,59 @@ def is_emotional_support_turn(text: str) -> bool:
     return has_emotion and not asks_knowledge
 
 
+def is_chitchat_turn(text: str) -> bool:
+    clean = _safe_strip(text)
+    if not clean:
+        return False
+    if _contains_any(clean, CHITCHAT_KEYWORDS):
+        return True
+    if len(clean) <= 12 and _contains_any(clean, ["你好", "hi", "hello", "谢谢", "再见"]):
+        return True
+    return False
+
+
+def has_negative_emotion(text: str) -> bool:
+    return _contains_any(_safe_strip(text), EMOTIONAL_SUPPORT_KEYWORDS)
+
+
+def is_knowledge_query(text: str) -> bool:
+    clean = _safe_strip(text)
+    if not clean:
+        return False
+    if _contains_any(clean, KNOWLEDGE_QUERY_HINTS):
+        return True
+    if ("?" in clean or "？" in clean) and _contains_any(clean, ["正念", "冥想", "mbsr", "mbct", "身体扫描"]):
+        return True
+    return False
+
+
+def has_any_script_slot(req: ScriptRequirements) -> bool:
+    return any(
+        value is not None
+        for value in [req.duration_min, req.where, req.what, req.core_goal]
+    )
+
+
+def is_script_collection_active(chat_history: Optional[List[Dict[str, str]]]) -> bool:
+    if not chat_history:
+        return False
+    last_ai = ""
+    for message in reversed(chat_history):
+        ai_text = _safe_strip(message.get("ai"))
+        if ai_text:
+            last_ai = ai_text
+            break
+    if not last_ai:
+        return False
+    markers = [
+        "我收到你想生成正念引导语脚本",
+        "需求确认完成，可以进入 Skill2",
+        "回复“开始生成脚本”即可",
+        "我先确认一个最关键问题",
+    ]
+    return _contains_any(last_ai, markers)
+
+
 def summarize_requirements(req: ScriptRequirements) -> str:
     return (
         f"时长：{req.duration_min or '未确认'} 分钟；"
@@ -429,7 +553,13 @@ def summarize_requirements(req: ScriptRequirements) -> str:
     )
 
 
-def format_intervention_message() -> str:
+def format_intervention_message(reason: SafetyReason = "none") -> str:
+    if reason == "dangerous_context":
+        return (
+            "你现在的安全最重要。你提到自己可能处在不适合做正念练习的场景（例如驾驶或操作设备）。"
+            "请先专注当前环境，等到停稳并确保安全后，我们再开始。"
+            "如果你愿意，等你安全下来后我可以用 1 分钟带你做一个超短放松练习。"
+        )
     return (
         "你现在的感受很重要，你不需要一个人扛着。"
         "如果你有立即伤害自己或他人的风险，请立刻联系当地紧急电话。"
@@ -468,6 +598,8 @@ def decision_from_dict(data: Dict) -> Skill1Decision:
     return Skill1Decision(
         route=data.get("route", "retrieval_qa"),
         risk_level=data.get("risk_level", "low"),
+        safety_reason=data.get("safety_reason", "none"),
+        negative_emotion=bool(data.get("negative_emotion", False)),
         state_tags=data.get("state_tags", []),
         energy_tags=data.get("energy_tags", []),
         script_requirements=req,
@@ -518,6 +650,18 @@ def _normalize_risk_level(risk_level: Any) -> RiskLevel:
     return risk_map.get(value, "low")
 
 
+def _normalize_safety_reason(safety_reason: Any) -> SafetyReason:
+    value = str(safety_reason or "").strip().lower()
+    reason_map = {
+        "none": "none",
+        "crisis": "crisis",
+        "self_harm": "crisis",
+        "dangerous_context": "dangerous_context",
+        "driving": "dangerous_context",
+    }
+    return reason_map.get(value, "none")
+
+
 def _coerce_duration_minutes(value: Any) -> Optional[int]:
     if isinstance(value, int):
         if 1 <= value <= 180:
@@ -566,11 +710,15 @@ def coerce_skill1_decision(
 
     route = _normalize_route(raw.get("route"))
     risk_level = _normalize_risk_level(raw.get("risk_level"))
+    safety_reason = _normalize_safety_reason(raw.get("safety_reason"))
+    negative_emotion = bool(raw.get("negative_emotion", False)) or fallback.negative_emotion
 
-    # Guardrail: if text has explicit high-risk signals, always prioritize intervene.
-    if detect_risk_level(merged_text) == "high":
+    # Rule-first safety guardrail: if text has explicit safety triggers, always intervene.
+    detected_safety_reason = detect_safety_reason(merged_text)
+    if detected_safety_reason != "none":
         route = "intervene"
-        risk_level = "high"
+        safety_reason = detected_safety_reason
+        risk_level = "high" if detected_safety_reason == "crisis" else "medium"
 
     if route == "retrieval_qa" and fallback.route == "script_gen":
         route = "script_gen"
@@ -607,6 +755,8 @@ def coerce_skill1_decision(
     return Skill1Decision(
         route=route,
         risk_level=risk_level,
+        safety_reason=safety_reason,
+        negative_emotion=negative_emotion,
         state_tags=state_tags,
         energy_tags=energy_tags,
         script_requirements=req,
@@ -622,28 +772,39 @@ def analyze_skill1(question: str, chat_history: Optional[List[Dict[str, str]]] =
     current_text = _safe_strip(question).lower()
 
     risk_level = detect_risk_level(merged_text)
+    safety_reason = detect_safety_reason(merged_text)
+    if safety_reason == "crisis":
+        risk_level = "high"
+    elif safety_reason == "dangerous_context" and risk_level == "low":
+        risk_level = "medium"
+
     state_tags = detect_state_tags(merged_text)
     energy_tags = detect_energy_tags(merged_text)
+    negative_emotion = has_negative_emotion(current_text)
 
-    if risk_level == "high":
+    if safety_reason != "none" or risk_level == "high":
         return Skill1Decision(
             route="intervene",
             risk_level=risk_level,
+            safety_reason=safety_reason,
+            negative_emotion=negative_emotion,
             state_tags=state_tags,
             energy_tags=energy_tags,
         )
 
-    history_text = "\n".join(human_history).lower()
-    script_intent = detect_script_intent(current_text) or (
-        detect_script_intent(history_text)
-        and not _contains_any(current_text, ["取消", "不用了", "先不", "换个问题"])
-    )
+    script_collection_active = is_script_collection_active(history)
+    current_req = extract_script_requirements(current_text)
+    should_continue_slot_collection = script_collection_active and has_any_script_slot(current_req)
+    script_intent = detect_script_intent(current_text) or should_continue_slot_collection
+
     if script_intent:
         script_requirements = extract_script_requirements(merged_text)
         missing_slots = get_missing_slots(script_requirements)
         return Skill1Decision(
             route="script_gen",
             risk_level=risk_level,
+            safety_reason=safety_reason,
+            negative_emotion=negative_emotion,
             state_tags=state_tags,
             energy_tags=energy_tags,
             script_requirements=script_requirements,
@@ -653,14 +814,20 @@ def analyze_skill1(question: str, chat_history: Optional[List[Dict[str, str]]] =
 
     if is_emotional_support_turn(current_text):
         route: Route = "simple_qa"
+    elif is_chitchat_turn(current_text):
+        route = "simple_qa"
     elif is_simple_qa(current_text):
         route: Route = "simple_qa"
+    elif is_knowledge_query(current_text):
+        route = "retrieval_qa"
     else:
         route = "retrieval_qa"
 
     return Skill1Decision(
         route=route,
         risk_level=risk_level,
+        safety_reason=safety_reason,
+        negative_emotion=negative_emotion,
         state_tags=state_tags,
         energy_tags=energy_tags,
     )

@@ -89,12 +89,15 @@ user.\
 
 SIMPLE_QA_TEMPLATE = """\
 你是正念陪伴助手，正在处理不需要检索的简单问题。
+用户负面情绪标记：{negative_emotion}
 
 回答要求：
 1) 用中文，简明、温和、可执行。
 2) 允许给出 1-3 条短建议。
 3) 不做医疗诊断，不夸大承诺。
-4) 如用户显著痛苦，先共情并建议寻求现实支持系统。\
+4) 如用户显著痛苦，先共情并建议寻求现实支持系统。
+5) 当负面情绪标记为 true 且用户未明确要求练习时，结尾可温柔补一句邀请：
+“如果你愿意，我可以陪你做一段很短的正念练习。”\
 """
 
 REPHRASE_TEMPLATE = """\
@@ -120,6 +123,8 @@ SKILL1_DECISION_TEMPLATE = """\
 {{
   "route": "intervene|simple_qa|retrieval_qa|script_gen",
   "risk_level": "low|medium|high",
+  "safety_reason": "none|crisis|dangerous_context",
+  "negative_emotion": true,
   "state_tags": ["mind:*","body:*","env:*","task:*"],
   "energy_tags": ["dopamine_low","vitality_low","belief_low"],
   "script_requirements": {{
@@ -131,10 +136,54 @@ SKILL1_DECISION_TEMPLATE = """\
 }}
 
 要求：
-1) 如已进入脚本收集流程，优先 route=script_gen。
-2) core_goal 可以自由文本，如“缓解焦虑”“快速平静下来”。
-3) 对不确定字段返回 null，不要编造。
-4) 只返回 JSON 对象本身。\
+1) 如用户出现高危信号或危险场景，必须 route=intervene。
+2) 用户仅在倾诉情绪且未明确要练习时，route=simple_qa，不要提前切到 script_gen。
+3) core_goal 可以自由文本，如“缓解焦虑”“快速平静下来”。
+4) 对不确定字段返回 null，不要编造。
+5) 只返回 JSON 对象本身。\
+"""
+
+SKILL1_FEWSHOT_EXAMPLES = """\
+Few-shot 参考（仅用于学习路由，不要复制文本）：
+示例1
+输入：我现在真的不想活了，感觉没有意义
+输出：{"route":"intervene","risk_level":"high","safety_reason":"crisis","negative_emotion":true,"state_tags":[],"energy_tags":[],"script_requirements":{"duration_min":null,"where":null,"what":null,"core_goal":null}}
+
+示例2
+输入：我在开车，有点慌，能带我做冥想吗
+输出：{"route":"intervene","risk_level":"medium","safety_reason":"dangerous_context","negative_emotion":true,"state_tags":[],"energy_tags":[],"script_requirements":{"duration_min":null,"where":null,"what":null,"core_goal":null}}
+
+示例3
+输入：今天天气不错，但工作有点烦
+输出：{"route":"simple_qa","risk_level":"low","safety_reason":"none","negative_emotion":true,"state_tags":["task:overload"],"energy_tags":[],"script_requirements":{"duration_min":null,"where":null,"what":null,"core_goal":null}}
+
+示例4
+输入：什么是身体扫描，它和观呼吸有什么区别？
+输出：{"route":"retrieval_qa","risk_level":"low","safety_reason":"none","negative_emotion":false,"state_tags":[],"energy_tags":[],"script_requirements":{"duration_min":null,"where":null,"what":null,"core_goal":null}}
+
+示例5
+输入：我想做一段睡前冥想，帮我放松入睡
+输出：{"route":"script_gen","risk_level":"low","safety_reason":"none","negative_emotion":false,"state_tags":["body:sleep"],"energy_tags":[],"script_requirements":{"duration_min":null,"where":"睡前","what":null,"core_goal":"放松入睡"}}
+"""
+
+SCRIPT_REQUIREMENT_FOLLOWUP_TEMPLATE = """\
+你是正念练习需求确认助手。你的任务是根据当前槽位状态，向用户提出“一个最关键的问题”，帮助补齐信息。
+
+当前已识别信息：
+- 时长（分钟）：{duration_min}
+- 场景：{where}
+- 当下状态：{what}
+- 核心目的：{core_goal}
+- 缺失槽位：{missing_slots}
+- 状态标签：{state_tags}
+- 能量标签：{energy_tags}
+
+输出要求：
+1) 用中文，只输出给用户看的话，不要解释。
+2) 先用 1 句温柔确认（不超过 20 字），再问 1 个最关键问题。
+3) 一次只问一个槽位，优先顺序：duration_min > where > what > core_goal。
+4) 如果用户明显在倾诉情绪，语气要接纳，不要像表单盘问。
+5) 不要一次问多个问题。\
 """
 
 SKILL2_SCRIPT_TEMPLATE = """\
@@ -322,8 +371,10 @@ def has_missing_script_slots(payload: Dict) -> bool:
     return bool(payload.get("skill1", {}).get("missing_slots"))
 
 
-def format_skill1_intervene_response(_: Dict) -> str:
-    return format_intervention_message()
+def format_skill1_intervene_response(payload: Dict) -> str:
+    skill1 = payload.get("skill1", {}) if isinstance(payload, dict) else {}
+    safety_reason = str(skill1.get("safety_reason", "none") or "none")
+    return format_intervention_message(reason=safety_reason)
 
 
 def format_skill1_script_followup_response(payload: Dict) -> str:
@@ -352,6 +403,27 @@ def apply_retrieval_filters(payload: Dict) -> Dict:
         **payload,
         "retrieval_filters": filters,
     }
+
+
+def fetch_script_docs_with_fallback(
+    retriever_obj: BaseRetriever,
+    query: str,
+    filters: Dict[str, str],
+    limit: int = 4,
+) -> List[Document]:
+    search_fn = getattr(retriever_obj, "search", None)
+    if callable(search_fn):
+        try:
+            docs = search_fn(query=query, filters=filters, limit=limit)
+            return docs if isinstance(docs, list) else []
+        except Exception as exc:
+            logger.warning("Skill2 hybrid search failed, fallback to invoke: %s", exc)
+    try:
+        docs = retriever_obj.invoke(query) or []
+        return docs if isinstance(docs, list) else []
+    except Exception as exc:
+        logger.warning("Skill2 retriever invoke failed: %s", exc)
+        return []
 
 
 def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
@@ -397,7 +469,7 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
             ("system", SKILL1_DECISION_TEMPLATE),
             (
                 "human",
-                "历史对话：\n{chat_history_text}\n\n最新用户输入：\n{question}",
+                "{fewshot_examples}\n\n历史对话：\n{chat_history_text}\n\n最新用户输入：\n{question}",
             ),
         ]
     )
@@ -408,6 +480,7 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         raw_decision: Dict[str, Any] = {}
         try:
             prompt_messages = skill1_prompt.format_messages(
+                fewshot_examples=SKILL1_FEWSHOT_EXAMPLES,
                 chat_history_text=stringify_chat_history(chat_history),
                 question=question,
             )
@@ -466,14 +539,12 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
             script_filters = {"track": "skill_script"}
             if where in ["睡眠", "焦虑", "压力", "感恩"]:
                 script_filters["scenario"] = where
-            if isinstance(retriever, HybridWeaviateRetriever):
-                script_docs = retriever.search(
-                    query=script_query,
-                    filters=script_filters,
-                    limit=4,
-                )
-            else:
-                script_docs = retriever.invoke(script_query) or []
+            script_docs = fetch_script_docs_with_fallback(
+                retriever_obj=retriever,
+                query=script_query,
+                filters=script_filters,
+                limit=4,
+            )
         except Exception as exc:
             logger.warning("Skill2 RAG retrieval failed, continue without context: %s", exc)
             script_docs = []
@@ -499,6 +570,39 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         | llm
         | StrOutputParser()
     ).with_config(run_name="Skill2GenerateScript")
+
+    requirement_followup_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", SCRIPT_REQUIREMENT_FOLLOWUP_TEMPLATE),
+            (
+                "human",
+                "请生成下一句补槽追问。",
+            ),
+        ]
+    )
+
+    def build_script_followup_inputs(payload: Dict) -> Dict[str, Any]:
+        decision = decision_from_dict(payload.get("skill1", {}))
+        req = decision.script_requirements
+        state_tags = "、".join(decision.state_tags) if decision.state_tags else "无"
+        energy_tags = "、".join(decision.energy_tags) if decision.energy_tags else "无"
+        missing_slots = "、".join(decision.missing_slots) if decision.missing_slots else "无"
+        return {
+            "duration_min": req.duration_min if req.duration_min is not None else "未确认",
+            "where": req.where or "未确认",
+            "what": req.what or "未确认",
+            "core_goal": req.core_goal or "未确认",
+            "missing_slots": missing_slots,
+            "state_tags": state_tags,
+            "energy_tags": energy_tags,
+        }
+
+    script_followup_chain = (
+        RunnableLambda(build_script_followup_inputs).with_config(run_name="Skill1FollowupBuildInput")
+        | requirement_followup_prompt
+        | llm
+        | StrOutputParser()
+    ).with_config(run_name="Skill1FollowupLLM")
 
     cohere_prompt = ChatPromptTemplate.from_messages(
         [
@@ -531,8 +635,16 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         | response_synthesizer
     ).with_config(run_name="RetrievalQAResponse")
 
+    def build_simple_qa_inputs(payload: Dict) -> Dict[str, Any]:
+        skill1 = payload.get("skill1", {}) if isinstance(payload, dict) else {}
+        return {
+            "question": payload.get("question", ""),
+            "chat_history": serialize_history(payload),
+            "negative_emotion": "true" if bool(skill1.get("negative_emotion", False)) else "false",
+        }
+
     simple_qa_chain = (
-        RunnablePassthrough.assign(chat_history=serialize_history)
+        RunnableLambda(build_simple_qa_inputs).with_config(run_name="SimpleQABuildInput")
         | simple_response_synthesizer
     ).with_config(run_name="SimpleQABranch")
 
@@ -551,9 +663,7 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
                 RunnableLambda(has_missing_script_slots).with_config(
                     run_name="RouteScriptFollowupCheck"
                 ),
-                RunnableLambda(format_skill1_script_followup_response).with_config(
-                    run_name="ScriptSlotFollowup"
-                ),
+                script_followup_chain,
             ),
             (
                 RunnableLambda(
