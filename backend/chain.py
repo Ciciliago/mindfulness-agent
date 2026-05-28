@@ -1,16 +1,25 @@
 import os
 import logging
+import json
+import re
 from operator import itemgetter
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import weaviate
 from backend.constants import WEAVIATE_DOCS_INDEX_NAME
+from backend.retrieval import HybridWeaviateRetriever, infer_retrieval_filters
+from backend.skill1 import (
+    coerce_skill1_decision,
+    decision_from_dict,
+    format_intervention_message,
+    format_script_followup_message,
+    format_script_ready_message,
+)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.ingest import get_embeddings_model
 from langchain_anthropic import ChatAnthropic
 from langchain_community.chat_models import ChatCohere
-from langchain_community.vectorstores import Weaviate
 from langchain_core.documents import Document
 from langchain_core.language_models import LanguageModelLike
 from langchain_core.messages import AIMessage, HumanMessage
@@ -39,36 +48,17 @@ from langsmith import Client
 logger = logging.getLogger(__name__)
 
 RESPONSE_TEMPLATE = """\
-You are an expert programmer and problem-solver, tasked with answering any question \
-about Langchain.
+你是一个谨慎、温和的正念助手。请仅基于检索到的资料回答问题，不要编造。
 
-Generate a comprehensive and informative answer of 80 words or less for the \
-given question based solely on the provided search results (URL and content). You must \
-only use information from the provided search results. Use an unbiased and \
-journalistic tone. Combine search results together into a coherent answer. Do not \
-repeat text. Cite search results using [${{number}}] notation. Only cite the most \
-relevant results that answer the question accurately. Place these citations at the end \
-of the sentence or paragraph that reference them - do not put them all at the end. If \
-different results refer to different entities within the same name, write separate \
-answers for each entity.
-
-You should use bullet points in your answer for readability. Put citations where they apply
-rather than putting them all at the end.
-
-If there is nothing in the context relevant to the question at hand, just say "Hmm, \
-I'm not sure." Don't try to make up an answer.
-
-Anything between the following `context`  html blocks is retrieved from a knowledge \
-bank, not part of the conversation with the user. 
+回答要求：
+1) 优先中文，简洁清晰，控制在 6 句以内。
+2) 只使用 context 中的信息；如信息不足，请直接说“我暂时无法从资料中确认”。
+3) 如果引用到不同资料，可在对应句末标注 [1] [2]。
+4) 语气保持支持性，不做医疗诊断。
 
 <context>
-    {context} 
-<context/>
-
-REMEMBER: If there is no relevant information within the context, just say "Hmm, I'm \
-not sure." Don't try to make up an answer. Anything between the preceding 'context' \
-html blocks is retrieved from a knowledge bank, not part of the conversation with the \
-user.\
+{context}
+</context>
 """
 
 COHERE_RESPONSE_TEMPLATE = """\
@@ -97,6 +87,16 @@ html blocks is retrieved from a knowledge bank, not part of the conversation wit
 user.\
 """
 
+SIMPLE_QA_TEMPLATE = """\
+你是正念陪伴助手，正在处理不需要检索的简单问题。
+
+回答要求：
+1) 用中文，简明、温和、可执行。
+2) 允许给出 1-3 条短建议。
+3) 不做医疗诊断，不夸大承诺。
+4) 如用户显著痛苦，先共情并建议寻求现实支持系统。\
+"""
+
 REPHRASE_TEMPLATE = """\
 Given the following conversation and a follow up question, rephrase the follow up \
 question to be a standalone question.
@@ -105,6 +105,68 @@ Chat History:
 {chat_history}
 Follow Up Input: {question}
 Standalone Question:"""
+
+SKILL1_DECISION_TEMPLATE = """\
+你是“Skill1 决策器”，负责根据聊天上下文识别路由和槽位。
+你必须输出 JSON 对象，禁止输出 markdown、解释、代码块。
+
+路由定义：
+- intervene: 有明显自伤/他伤风险，需要安全干预
+- simple_qa: 简单支持性对话或无需检索的问题
+- retrieval_qa: 需要知识库检索的问题
+- script_gen: 用户希望生成正念引导语脚本，或正在补齐脚本需求槽位
+
+请结合“历史对话 + 最新用户输入”，输出：
+{{
+  "route": "intervene|simple_qa|retrieval_qa|script_gen",
+  "risk_level": "low|medium|high",
+  "state_tags": ["mind:*","body:*","env:*","task:*"],
+  "energy_tags": ["dopamine_low","vitality_low","belief_low"],
+  "script_requirements": {{
+    "duration_min": null,
+    "where": null,
+    "what": null,
+    "core_goal": null
+  }}
+}}
+
+要求：
+1) 如已进入脚本收集流程，优先 route=script_gen。
+2) core_goal 可以自由文本，如“缓解焦虑”“快速平静下来”。
+3) 对不确定字段返回 null，不要编造。
+4) 只返回 JSON 对象本身。\
+"""
+
+SKILL2_SCRIPT_TEMPLATE = """\
+你是资深正念引导语脚本作者。请基于已确认槽位生成一段可直接朗读的中文正念引导语。
+
+要求：
+1) 只输出脚本文本正文，不要解释、不要标题、不要 JSON。
+2) 语气温和、慢节奏、第二人称（“你”）。
+3) 安全边界：不做医疗诊断，不承诺治愈，不使用绝对化表达。
+4) 结构：
+   - 安顿开场（落地、姿势、呼吸）
+   - 核心引导（贴合用户状态与核心目的）
+   - 收束结束（回到当下、过渡回任务/休息）
+5) 可使用“（停顿3秒）”等停顿提示，便于朗读。
+6) 长度按时长控制：
+   - 3-5 分钟：约 450-700 字
+   - 6-10 分钟：约 700-1200 字
+   - 11-20 分钟：约 1200-1800 字
+
+若提供了 RAG 参考片段，可借鉴其表达方式，但不要逐字复制。\
+"""
+
+SCRIPT2_START_KEYWORDS = [
+    "开始生成脚本",
+    "开始生成",
+    "直接生成",
+    "现在生成",
+    "生成吧",
+    "开始吧",
+    "继续生成",
+    "开始写脚本",
+]
 
 
 client = Client()
@@ -144,15 +206,14 @@ def get_retriever() -> BaseRetriever:
             auth_client_secret=weaviate.AuthApiKey(api_key=WEAVIATE_API_KEY),
             startup_period=None,
         )
-        weaviate_client = Weaviate(
+        return HybridWeaviateRetriever(
             client=weaviate_client,
-            index_name=WEAVIATE_DOCS_INDEX_NAME,
-            text_key="text",
-            embedding=get_embeddings_model(),
-            by_text=False,
-            attributes=["source", "title"],
+            embedding_model=get_embeddings_model(),
+            class_name=WEAVIATE_DOCS_INDEX_NAME,
+            k=6,
+            fetch_k=20,
+            alpha=0.58,
         )
-        return weaviate_client.as_retriever(search_kwargs=dict(k=6))
     except Exception as exc:
         logger.exception("Failed to initialize Weaviate retriever; falling back to empty retriever: %s", exc)
         return EmptyRetriever()
@@ -203,24 +264,241 @@ def serialize_history(request: ChatRequest):
     return converted_chat_history
 
 
+def stringify_chat_history(chat_history: Optional[List[Dict[str, str]]]) -> str:
+    lines: List[str] = []
+    for message in chat_history or []:
+        human = message.get("human")
+        ai = message.get("ai")
+        if human:
+            lines.append(f"用户: {human}")
+        if ai:
+            lines.append(f"助手: {ai}")
+    return "\n".join(lines) if lines else "(empty)"
+
+
+def parse_skill1_json(raw_content: Any) -> Dict[str, Any]:
+    if isinstance(raw_content, list):
+        raw_text = "".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in raw_content
+        )
+    else:
+        raw_text = str(raw_content or "")
+    text = raw_text.strip()
+    if not text:
+        return {}
+
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+
+    fence_cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    if fence_cleaned:
+        try:
+            parsed = json.loads(fence_cleaned)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            pass
+
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def is_route(payload: Dict, route: str) -> bool:
+    return payload.get("skill1", {}).get("route") == route
+
+
+def has_missing_script_slots(payload: Dict) -> bool:
+    if not is_route(payload, "script_gen"):
+        return False
+    return bool(payload.get("skill1", {}).get("missing_slots"))
+
+
+def format_skill1_intervene_response(_: Dict) -> str:
+    return format_intervention_message()
+
+
+def format_skill1_script_followup_response(payload: Dict) -> str:
+    decision = decision_from_dict(payload.get("skill1", {}))
+    return format_script_followup_message(decision)
+
+
+def format_skill1_script_ready_response(payload: Dict) -> str:
+    decision = decision_from_dict(payload.get("skill1", {}))
+    return format_script_ready_message(decision)
+
+
+def should_generate_skill2(payload: Dict) -> bool:
+    if not is_route(payload, "script_gen") or has_missing_script_slots(payload):
+        return False
+    raw_question = str(payload.get("question", "") or "")
+    normalized = re.sub(r"\s+", "", raw_question.lower())
+    return any(keyword in normalized for keyword in SCRIPT2_START_KEYWORDS)
+
+
+def apply_retrieval_filters(payload: Dict) -> Dict:
+    query = str(payload.get("question", "") or "")
+    skill1 = payload.get("skill1", {})
+    filters = infer_retrieval_filters(query=query, skill1=skill1)
+    return {
+        **payload,
+        "retrieval_filters": filters,
+    }
+
+
 def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
-    retriever_chain = create_retriever_chain(
-        llm,
-        retriever,
-    ).with_config(run_name="FindDocs")
+    if isinstance(retriever, HybridWeaviateRetriever):
+        def retrieve_with_dynamic_filters(payload: Dict) -> List[Document]:
+            query = str(payload.get("question", "") or "")
+            filters = payload.get("retrieval_filters", {}) or {}
+            return retriever.search(query=query, filters=filters, limit=6)
+
+        retriever_chain = RunnableLambda(retrieve_with_dynamic_filters).with_config(run_name="FindDocs")
+    else:
+        retriever_chain = create_retriever_chain(
+            llm,
+            retriever,
+        ).with_config(run_name="FindDocs")
     context = (
         RunnablePassthrough.assign(docs=retriever_chain)
         .assign(context=lambda x: format_docs(x["docs"]))
         .with_config(run_name="RetrieveDocs")
     )
-    prompt = ChatPromptTemplate.from_messages(
+    retrieval_prompt = ChatPromptTemplate.from_messages(
         [
             ("system", RESPONSE_TEMPLATE),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{question}"),
         ]
     )
-    default_response_synthesizer = prompt | llm
+    default_response_synthesizer = retrieval_prompt | llm
+
+    simple_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", SIMPLE_QA_TEMPLATE),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{question}"),
+        ]
+    )
+    simple_response_synthesizer = (simple_prompt | llm | StrOutputParser()).with_config(
+        run_name="SimpleQAResponse"
+    )
+
+    skill1_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", SKILL1_DECISION_TEMPLATE),
+            (
+                "human",
+                "历史对话：\n{chat_history_text}\n\n最新用户输入：\n{question}",
+            ),
+        ]
+    )
+
+    def attach_skill1_decision(request: Dict, config: Optional[Dict] = None) -> Dict:
+        question = request.get("question", "")
+        chat_history = request.get("chat_history")
+        raw_decision: Dict[str, Any] = {}
+        try:
+            prompt_messages = skill1_prompt.format_messages(
+                chat_history_text=stringify_chat_history(chat_history),
+                question=question,
+            )
+            llm_response = llm.invoke(prompt_messages, config=config)
+            raw_decision = parse_skill1_json(getattr(llm_response, "content", ""))
+        except Exception as exc:
+            logger.warning("Skill1 LLM decision failed, falling back to heuristic parser: %s", exc)
+            raw_decision = {}
+
+        decision = coerce_skill1_decision(
+            raw=raw_decision,
+            question=question,
+            chat_history=chat_history,
+        )
+        return {
+            **request,
+            "skill1": decision.to_dict(),
+        }
+
+    skill2_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", SKILL2_SCRIPT_TEMPLATE),
+            (
+                "human",
+                "请根据以下信息生成脚本：\n"
+                "- 时长（分钟）：{duration_min}\n"
+                "- 场景：{where}\n"
+                "- 当下状态：{what}\n"
+                "- 核心目的：{core_goal}\n"
+                "- 状态标签：{state_tags}\n"
+                "- 能量标签：{energy_tags}\n\n"
+                "用户刚刚的确认语：{latest_user_message}\n\n"
+                "RAG可参考片段（可选）：\n{script_context}",
+            ),
+        ]
+    )
+
+    def build_skill2_prompt_inputs(payload: Dict) -> Dict[str, Any]:
+        decision = decision_from_dict(payload.get("skill1", {}))
+        req = decision.script_requirements
+        duration_min = req.duration_min or 8
+        where = req.where or "未提供"
+        what = req.what or "未提供"
+        core_goal = req.core_goal or "放松并回到当下"
+        state_tags = "、".join(decision.state_tags) if decision.state_tags else "无"
+        energy_tags = "、".join(decision.energy_tags) if decision.energy_tags else "无"
+        latest_user_message = str(payload.get("question", "") or "")
+
+        script_query = (
+            f"正念引导语 脚本 {duration_min}分钟 "
+            f"场景:{where} 状态:{what} 目标:{core_goal}"
+        )
+        script_docs = []
+        try:
+            # RAG is optional for Skill2: retrieve script chunks when available.
+            script_filters = {"track": "skill_script"}
+            if where in ["睡眠", "焦虑", "压力", "感恩"]:
+                script_filters["scenario"] = where
+            if isinstance(retriever, HybridWeaviateRetriever):
+                script_docs = retriever.search(
+                    query=script_query,
+                    filters=script_filters,
+                    limit=4,
+                )
+            else:
+                script_docs = retriever.invoke(script_query) or []
+        except Exception as exc:
+            logger.warning("Skill2 RAG retrieval failed, continue without context: %s", exc)
+            script_docs = []
+
+        if not isinstance(script_docs, list):
+            script_docs = []
+        script_context = format_docs(script_docs[:4]) if script_docs else "（无可用参考片段）"
+
+        return {
+            "duration_min": duration_min,
+            "where": where,
+            "what": what,
+            "core_goal": core_goal,
+            "state_tags": state_tags,
+            "energy_tags": energy_tags,
+            "latest_user_message": latest_user_message,
+            "script_context": script_context,
+        }
+
+    skill2_script_chain = (
+        RunnableLambda(build_skill2_prompt_inputs).with_config(run_name="Skill2BuildInput")
+        | skill2_prompt
+        | llm
+        | StrOutputParser()
+    ).with_config(run_name="Skill2GenerateScript")
 
     cohere_prompt = ChatPromptTemplate.from_messages(
         [
@@ -245,10 +523,64 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         )
         | StrOutputParser()
     ).with_config(run_name="GenerateResponse")
-    return (
+
+    retrieval_qa_chain = (
         RunnablePassthrough.assign(chat_history=serialize_history)
+        | RunnableLambda(apply_retrieval_filters).with_config(run_name="ApplyRetrievalFilters")
         | context
         | response_synthesizer
+    ).with_config(run_name="RetrievalQAResponse")
+
+    simple_qa_chain = (
+        RunnablePassthrough.assign(chat_history=serialize_history)
+        | simple_response_synthesizer
+    ).with_config(run_name="SimpleQABranch")
+
+    return (
+        RunnableLambda(attach_skill1_decision).with_config(run_name="Skill1Decision")
+        | RunnableBranch(
+            (
+                RunnableLambda(lambda x: is_route(x, "intervene")).with_config(
+                    run_name="RouteInterveneCheck"
+                ),
+                RunnableLambda(format_skill1_intervene_response).with_config(
+                    run_name="InterventionResponse"
+                ),
+            ),
+            (
+                RunnableLambda(has_missing_script_slots).with_config(
+                    run_name="RouteScriptFollowupCheck"
+                ),
+                RunnableLambda(format_skill1_script_followup_response).with_config(
+                    run_name="ScriptSlotFollowup"
+                ),
+            ),
+            (
+                RunnableLambda(
+                    lambda x: is_route(x, "script_gen")
+                    and not has_missing_script_slots(x)
+                    and should_generate_skill2(x)
+                ).with_config(run_name="RouteSkill2GenerateCheck"),
+                skill2_script_chain,
+            ),
+            (
+                RunnableLambda(
+                    lambda x: is_route(x, "script_gen")
+                    and not has_missing_script_slots(x)
+                    and not should_generate_skill2(x)
+                ).with_config(run_name="RouteScriptReadyCheck"),
+                RunnableLambda(format_skill1_script_ready_response).with_config(
+                    run_name="ScriptReady"
+                ),
+            ),
+            (
+                RunnableLambda(lambda x: is_route(x, "simple_qa")).with_config(
+                    run_name="RouteSimpleQACheck"
+                ),
+                simple_qa_chain,
+            ),
+            retrieval_qa_chain,
+        ).with_config(run_name="Skill1Router")
     )
 
 
