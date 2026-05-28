@@ -83,6 +83,29 @@ SCRIPT_INTENT_KEYWORDS = [
     "放松练习",
 ]
 
+SCRIPT_ACCEPTANCE_KEYWORDS = [
+    "好",
+    "好呀",
+    "好的",
+    "好啊",
+    "可以",
+    "可以的",
+    "行",
+    "行的",
+    "来吧",
+    "开始",
+    "开始吧",
+    "试试",
+    "那就来",
+]
+
+PRACTICE_INVITE_MARKERS = [
+    "我可以陪你做一段很短的正念练习",
+    "我可以陪你做一段正念练习",
+    "如果你愿意，我们可以做一段",
+    "如果你愿意，我可以带你做",
+]
+
 SIMPLE_QA_KEYWORDS = [
     "你好",
     "hi",
@@ -544,6 +567,31 @@ def is_script_collection_active(chat_history: Optional[List[Dict[str, str]]]) ->
     return _contains_any(last_ai, markers)
 
 
+def is_short_acceptance(text: str) -> bool:
+    clean = re.sub(r"\s+", "", _safe_strip(text))
+    if not clean:
+        return False
+    if clean in SCRIPT_ACCEPTANCE_KEYWORDS:
+        return True
+    if len(clean) <= 6 and any(clean.startswith(k) for k in ["好", "可", "行", "来", "开"]):
+        return True
+    return False
+
+
+def did_ai_invite_practice(chat_history: Optional[List[Dict[str, str]]]) -> bool:
+    if not chat_history:
+        return False
+    last_ai = ""
+    for message in reversed(chat_history):
+        ai_text = _safe_strip(message.get("ai"))
+        if ai_text:
+            last_ai = ai_text
+            break
+    if not last_ai:
+        return False
+    return _contains_any(last_ai, PRACTICE_INVITE_MARKERS)
+
+
 def summarize_requirements(req: ScriptRequirements) -> str:
     return (
         f"时长：{req.duration_min or '未确认'} 分钟；"
@@ -720,7 +768,7 @@ def coerce_skill1_decision(
         safety_reason = detected_safety_reason
         risk_level = "high" if detected_safety_reason == "crisis" else "medium"
 
-    if route == "retrieval_qa" and fallback.route == "script_gen":
+    if route in ("retrieval_qa", "simple_qa") and fallback.route == "script_gen":
         route = "script_gen"
     if route == "retrieval_qa" and is_emotional_support_turn(current_text):
         route = "simple_qa"
@@ -793,9 +841,15 @@ def analyze_skill1(question: str, chat_history: Optional[List[Dict[str, str]]] =
         )
 
     script_collection_active = is_script_collection_active(history)
+    invited_to_practice = did_ai_invite_practice(history)
     current_req = extract_script_requirements(current_text)
     should_continue_slot_collection = script_collection_active and has_any_script_slot(current_req)
-    script_intent = detect_script_intent(current_text) or should_continue_slot_collection
+    accepted_after_invite = invited_to_practice and is_short_acceptance(current_text)
+    script_intent = (
+        detect_script_intent(current_text)
+        or should_continue_slot_collection
+        or accepted_after_invite
+    )
 
     if script_intent:
         script_requirements = extract_script_requirements(merged_text)
