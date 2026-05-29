@@ -2,7 +2,6 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { RemoteRunnable } from "@langchain/core/runnables/remote";
 
 import { EmptyState } from "./EmptyState";
 import { ChatMessageBubble, Message } from "./ChatMessageBubble";
@@ -104,43 +103,56 @@ export function ChatWindow(props: { conversationId: string }) {
     };
     marked.setOptions({ renderer });
     try {
-      const remoteChain = new RemoteRunnable({
-        url: apiBaseUrl + "/chat",
-        options: {
-          timeout: 180000,
-        },
-      });
       const llmDisplayName = llm ?? "xiaomi_mimo_v2_flash";
-      const invokeResponse: any = await remoteChain.invoke(
-        {
-          question: messageValue,
-          chat_history: chatHistory,
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 180000);
+      const response = await fetch(apiBaseUrl + "/chat/invoke", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
         },
-        {
-          configurable: {
-            llm: llmDisplayName,
+        signal: controller.signal,
+        body: JSON.stringify({
+          input: {
+            question: messageValue,
+            chat_history: chatHistory,
           },
-          tags: ["model:" + llmDisplayName],
-          metadata: {
-            conversation_id: conversationId,
-            llm: llmDisplayName,
+          config: {
+            configurable: {
+              llm: llmDisplayName,
+            },
+            tags: ["model:" + llmDisplayName],
+            metadata: {
+              conversation_id: conversationId,
+              llm: llmDisplayName,
+            },
           },
-        },
-      );
+        }),
+      });
+      clearTimeout(timeout);
+      const invokeResponse: any = await response.json();
 
-      if (typeof invokeResponse === "string") {
-        assistantMessage = invokeResponse;
-      } else if (invokeResponse && typeof invokeResponse === "object") {
-        if (typeof invokeResponse.output === "string") {
-          assistantMessage = invokeResponse.output;
-        } else if (invokeResponse.output !== undefined) {
-          assistantMessage = JSON.stringify(invokeResponse.output);
-        }
+      if (!response.ok) {
+        throw new Error(
+          typeof invokeResponse?.message === "string"
+            ? invokeResponse.message
+            : `请求失败: ${response.status}`,
+        );
+      }
+
+      const output = invokeResponse?.output;
+      if (typeof output === "string") {
+        assistantMessage = output;
+      } else if (output !== undefined) {
+        assistantMessage = JSON.stringify(output);
+      }
+
+      if (invokeResponse && typeof invokeResponse === "object") {
         const runIdCandidate =
           invokeResponse?.metadata?.run_id ??
           invokeResponse?.run_id ??
-          invokeResponse?.output?.metadata?.run_id ??
-          invokeResponse?.output?.run_id;
+          output?.metadata?.run_id ??
+          output?.run_id;
         if (typeof runIdCandidate === "string" && runIdCandidate.trim() !== "") {
           runId = runIdCandidate;
         } else {

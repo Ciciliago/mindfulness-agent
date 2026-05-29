@@ -378,6 +378,8 @@ def extract_what(text: str) -> Optional[str]:
         "自习",
         "学习",
         "工作",
+        "刚画完水彩",
+        "画完水彩",
         "开会前",
         "开会后",
         "加班后",
@@ -407,6 +409,22 @@ def extract_what(text: str) -> Optional[str]:
     if recent_done_match:
         return f"{recent_done_match.group(1)}{recent_done_match.group(2)}".strip()
 
+    # Cover natural short phrases like "刚画完水彩" / "画完水彩".
+    completion_action_match = re.search(
+        r"((?:刚|刚刚)?(?:画|写|做|学|看|读|练|跑|开|赶|改|处理|整理)"
+        r"[^，。！？\n]{0,12}(?:完|完了|结束了|收尾了|后|之后))",
+        text,
+    )
+    if completion_action_match:
+        return completion_action_match.group(1).strip(" ，。！？\n")
+
+    completion_phrase_match = re.search(
+        r"((?:画|写|做|学|看|读|练|跑|开|赶|改|处理|整理)[^，。！？\n]{0,10}完(?:了)?)",
+        text,
+    )
+    if completion_phrase_match:
+        return completion_phrase_match.group(1).strip(" ，。！？\n")
+
     doing_match = re.search(
         r"(?:正在|在)\s*(做|写|学|看|赶|准备|复习|处理|开会|上课|通勤|运动|休息)\s*([^，。！？\n]{0,16})",
         text,
@@ -424,6 +442,18 @@ def extract_what(text: str) -> Optional[str]:
     match = re.search(r"(正在|在)([^，。！？\n]{2,18})(时|的时候|中)", text)
     if match:
         return match.group(2)
+
+    # Last-resort fallback: if user sends a short completion fragment, accept it as `what`.
+    compact = _safe_strip(text)
+    if (
+        compact
+        and len(compact) <= 14
+        and "？" not in compact
+        and "?" not in compact
+        and _contains_any(compact, ["完", "后", "刚"])
+        and _contains_any(compact, ["画", "写", "做", "学", "看", "读", "练", "赶", "改", "处理"])
+    ):
+        return compact
     return None
 
 
