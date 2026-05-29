@@ -424,6 +424,14 @@ def fetch_script_docs_with_fallback(
         return []
 
 
+def relax_script_filters(filters: Dict[str, str]) -> Dict[str, str]:
+    relaxed = dict(filters or {})
+    # keep track constraint, progressively relax narrow fields
+    relaxed.pop("scenario", None)
+    relaxed.pop("topic", None)
+    return relaxed
+
+
 def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     if isinstance(retriever, HybridWeaviateRetriever):
         def retrieve_with_dynamic_filters(payload: Dict) -> List[Document]:
@@ -556,9 +564,9 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
             "入境 觉察 接纳 充能 收束"
         )
         script_docs = []
+        script_filters = {"track": "skill_script"}
         try:
-            # RAG is optional for Skill2: retrieve script chunks when available.
-            script_filters = {"track": "skill_script"}
+            # Skill2 RAG: prefer metadata-constrained retrieval.
             if where in ["睡眠", "焦虑", "压力", "感恩"]:
                 script_filters["scenario"] = where
             script_docs = fetch_script_docs_with_fallback(
@@ -570,6 +578,30 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         except Exception as exc:
             logger.warning("Skill2 RAG retrieval failed, continue without context: %s", exc)
             script_docs = []
+
+        # Require at least 2 script references; if not enough, retry with relaxed filters.
+        if len(script_docs) < 2:
+            relaxed_filters = relax_script_filters(script_filters)
+            if relaxed_filters != script_filters:
+                try:
+                    retry_docs = fetch_script_docs_with_fallback(
+                        retriever_obj=retriever,
+                        query=script_query,
+                        filters=relaxed_filters,
+                        limit=6,
+                    )
+                    script_docs = retry_docs if isinstance(retry_docs, list) else script_docs
+                except Exception as exc:
+                    logger.warning("Skill2 relaxed RAG retrieval failed: %s", exc)
+
+        script_rag_miss = len(script_docs) < 2
+        if script_rag_miss:
+            logger.warning(
+                "Skill2 RAG miss: insufficient docs (count=%s), query=%s, filters=%s",
+                len(script_docs),
+                script_query,
+                script_filters,
+            )
 
         if not isinstance(script_docs, list):
             script_docs = []

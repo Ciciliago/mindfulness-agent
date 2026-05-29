@@ -136,7 +136,20 @@ export function ChatWindow(props: { conversationId: string }) {
         } else if (invokeResponse.output !== undefined) {
           assistantMessage = JSON.stringify(invokeResponse.output);
         }
-        runId = invokeResponse?.metadata?.run_id;
+        const runIdCandidate =
+          invokeResponse?.metadata?.run_id ??
+          invokeResponse?.run_id ??
+          invokeResponse?.output?.metadata?.run_id ??
+          invokeResponse?.output?.run_id;
+        if (typeof runIdCandidate === "string" && runIdCandidate.trim() !== "") {
+          runId = runIdCandidate;
+        } else {
+          console.warn("[chat] invoke response missing run_id", {
+            keys: Object.keys(invokeResponse || {}),
+            hasMetadata: Boolean(invokeResponse?.metadata),
+            hasOutput: Boolean(invokeResponse?.output),
+          });
+        }
       }
 
       if (!assistantMessage) {
