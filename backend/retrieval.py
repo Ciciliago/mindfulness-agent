@@ -126,48 +126,6 @@ def infer_retrieval_filters(
     return filters
 
 
-def infer_script_filters(
-    where: str = "",
-    what: str = "",
-    core_goal: str = "",
-    state_tags: Optional[List[str]] = None,
-) -> Dict[str, str]:
-    """Infer metadata filters for script retrieval."""
-    text = _normalize_text(" ".join([where or "", what or "", core_goal or ""]))
-    filters: Dict[str, str] = {"track": "skill_script"}
-
-    scenario_map: Sequence[Tuple[List[str], str]] = [
-        (["睡前", "入睡", "失眠", "床上"], "睡眠"),
-        (["焦虑", "紧张", "不安", "惊慌"], "焦虑"),
-        (["压力", "压抑", "任务", "项目"], "压力"),
-        (["感恩", "感谢", "欣赏"], "感恩"),
-    ]
-    for keys, scenario in scenario_map:
-        if any(k in text for k in keys):
-            filters["scenario"] = scenario
-            break
-
-    topic_map: Sequence[Tuple[List[str], str]] = [
-        (["呼吸", "观呼吸"], "呼吸觉察"),
-        (["身体扫描", "身体"], "身体扫描"),
-        (["念头", "思绪"], "念头觉察"),
-        (["接纳", "不评判"], "内心接纳"),
-        (["专注", "学习", "工作"], "专注"),
-    ]
-    for keys, topic in topic_map:
-        if any(k in text for k in keys):
-            filters["topic"] = topic
-            break
-
-    tags = state_tags or []
-    if "body:sleep" in tags:
-        filters.setdefault("scenario", "睡眠")
-    if "task:overload" in tags:
-        filters.setdefault("scenario", "压力")
-
-    return filters
-
-
 class HybridWeaviateRetriever(BaseRetriever):
     """Weaviate hybrid retriever with optional metadata filters and rerank."""
 
