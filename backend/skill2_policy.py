@@ -97,12 +97,13 @@ def build_block_response(reason: str) -> str:
 
 def duration_targets(duration_min: int, mode: str) -> Dict[str, int]:
     safe_duration = max(1, min(30, int(duration_min or 8)))
-    chars_per_min = 170 if mode == "full" else 145
+    # More conservative speaking speed for Chinese guided narration.
+    chars_per_min = 145 if mode == "full" else 125
     target = safe_duration * chars_per_min
     return {
         "target": target,
-        "min": int(target * 0.82),
-        "max": int(target * 1.18),
+        "min": int(target * 0.88),
+        "max": int(target * 1.12),
         "chars_per_min": chars_per_min,
     }
 
@@ -136,7 +137,13 @@ def _estimate_minutes_by_chars(text: str, chars_per_min: int) -> float:
     chars = len(re.sub(r"\s+", "", text or ""))
     if chars_per_min <= 0:
         return 0.0
-    return chars / chars_per_min
+    pause_seconds = 0
+    for sec in re.findall(r"停顿\s*(\d{1,2})\s*秒", text or ""):
+        try:
+            pause_seconds += int(sec)
+        except Exception:
+            pass
+    return (chars / chars_per_min) + (pause_seconds / 60.0)
 
 
 def _personalization_hits(script: str, where: str, what: str, core_goal: str) -> int:

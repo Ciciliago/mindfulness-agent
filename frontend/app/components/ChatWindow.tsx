@@ -27,11 +27,8 @@ import { Source } from "./SourceBubble";
 import { apiBaseUrl } from "../utils/constants";
 
 const MODEL_TYPES = [
-  "xiaomi_mimo_v2_flash",
-  "deepseek_r1",
-  "mistralai_devstral",
-  "deepseek_r1t2_chimera",
-  "glm_4_5_air",
+  "stable_primary",
+  "stable_fallback",
 ];
 
 const defaultLlmValue =
@@ -48,11 +45,12 @@ export function ChatWindow(props: { conversationId: string }) {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [llm, setLlm] = useState(
-    searchParams.get("llm") ?? "xiaomi_mimo_v2_flash",
+    searchParams.get("llm") ?? "stable_primary",
   );
   const [llmIsLoading, setLlmIsLoading] = useState(true);
   useEffect(() => {
-    setLlm(searchParams.get("llm") ?? defaultLlmValue);
+    const raw = searchParams.get("llm") ?? defaultLlmValue;
+    setLlm(MODEL_TYPES.includes(raw) ? raw : "stable_primary");
     setLlmIsLoading(false);
   }, []);
 
@@ -110,7 +108,7 @@ export function ChatWindow(props: { conversationId: string }) {
           timeout: 180000,
         },
       });
-      const llmDisplayName = llm ?? "xiaomi_mimo_v2_flash";
+      const llmDisplayName = llm ?? "stable_primary";
       const invokeResponse: any = await remoteChain.invoke(
         {
           question: messageValue,
@@ -240,11 +238,8 @@ export function ChatWindow(props: { conversationId: string }) {
                 }}
                 width={"240px"}
               >
-                <option value="xiaomi_mimo_v2_flash">Xiaomi Mimo V2 Flash (Free)</option>
-                <option value="deepseek_r1">DeepSeek R1 (Free)</option>
-                <option value="mistralai_devstral">Mistral Devstral (Free)</option>
-                <option value="deepseek_r1t2_chimera">DeepSeek R1T2 Chimera (Free)</option>
-                <option value="glm_4_5_air">GLM 4.5 Air (Free)</option>
+                <option value="stable_primary">Stable Primary (Free)</option>
+                <option value="stable_fallback">Stable Fallback (Free)</option>
               </Select>
             )}
           </div>

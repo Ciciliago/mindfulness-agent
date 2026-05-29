@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import weaviate
 from backend.constants import WEAVIATE_DOCS_INDEX_NAME
-from backend.retrieval import HybridWeaviateRetriever, infer_retrieval_filters
+from backend.retrieval import HybridWeaviateRetriever, infer_retrieval_filters, infer_script_filters
 from backend.skill2_policy import (
     build_block_response,
     classify_script_mode,
@@ -195,7 +195,7 @@ SKILL2_SCRIPT_TEMPLATE = """\
    - 治愈/治疗/治好/缓解症状/诊断
    - 必须/一定要/不许动/不准睁眼
 8) 必须遵守字数预算（来自输入）：总字数范围与各步骤建议字数。
-9) 若提供了 RAG 参考片段，可借鉴其表达方式，但不要逐字复制。\
+9) 若提供了 RAG 参考片段，至少吸收其中 2 个专业表达要点，但不要逐字复制。\
 """
 
 SKILL2_REWRITE_TEMPLATE = """\
@@ -424,6 +424,26 @@ def fetch_script_docs_with_fallback(
         return []
 
 
+def format_script_rag_context(docs: List[Document], max_items: int = 4) -> str:
+    if not docs:
+        return "（无可用参考片段）"
+    lines: List[str] = []
+    for i, doc in enumerate(docs[:max_items], start=1):
+        meta = doc.metadata or {}
+        title = str(meta.get("chunk_title_zh") or meta.get("title") or f"片段{i}")
+        scenario = str(meta.get("scenario") or "未标注")
+        topic = str(meta.get("topic") or "未标注")
+        summary = str(meta.get("chunk_summary_zh") or "").strip()
+        text = (doc.page_content or "").strip().replace("\n", " ")
+        if not summary:
+            summary = text[:220]
+        lines.append(
+            f"[{i}] 标题:{title} | 场景:{scenario} | 主题:{topic}\n"
+            f"要点:{summary}"
+        )
+    return "\n\n".join(lines)
+
+
 def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     if isinstance(retriever, HybridWeaviateRetriever):
         def retrieve_with_dynamic_filters(payload: Dict) -> List[Document]:
@@ -557,15 +577,18 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         )
         script_docs = []
         try:
-            # RAG is optional for Skill2: retrieve script chunks when available.
-            script_filters = {"track": "skill_script"}
-            if where in ["睡眠", "焦虑", "压力", "感恩"]:
-                script_filters["scenario"] = where
+            # RAG with hybrid retrieval + metadata filter + rerank.
+            script_filters = infer_script_filters(
+                where=where,
+                what=what,
+                core_goal=core_goal,
+                state_tags=decision.state_tags,
+            )
             script_docs = fetch_script_docs_with_fallback(
                 retriever_obj=retriever,
                 query=script_query,
                 filters=script_filters,
-                limit=4,
+                limit=6,
             )
         except Exception as exc:
             logger.warning("Skill2 RAG retrieval failed, continue without context: %s", exc)
@@ -573,7 +596,7 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
 
         if not isinstance(script_docs, list):
             script_docs = []
-        script_context = format_docs(script_docs[:4]) if script_docs else "（无可用参考片段）"
+        script_context = format_script_rag_context(script_docs, max_items=4)
 
         return {
             "script_mode": script_mode,
@@ -672,17 +695,9 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     def cohere_response_synthesizer(input: dict) -> RunnableSequence:
         return cohere_prompt | llm.bind(source_documents=input["docs"])
 
-    response_synthesizer = (
-        default_response_synthesizer.configurable_alternatives(
-            ConfigurableField("llm"),
-            default_key="xiaomi_mimo_v2_flash",
-            deepseek_r1=default_response_synthesizer,
-            mistralai_devstral=default_response_synthesizer,
-            deepseek_r1t2_chimera=default_response_synthesizer,
-            glm_4_5_air=default_response_synthesizer,
-        )
-        | StrOutputParser()
-    ).with_config(run_name="GenerateResponse")
+    response_synthesizer = (default_response_synthesizer | StrOutputParser()).with_config(
+        run_name="GenerateResponse"
+    )
 
     retrieval_qa_chain = (
         RunnablePassthrough.assign(chat_history=serialize_history)
@@ -750,52 +765,32 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
     )
 
 
-gpt_3_5 = ChatOpenAI(
-    model="xiaomi/mimo-v2-flash:free",
+stable_primary = ChatOpenAI(
+    model=os.getenv("OPENROUTER_MODEL_PRIMARY", "z-ai/glm-4.5-air:free"),
     temperature=0,
     streaming=True,
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-    openai_api_base="https://openrouter.ai/api/v1"
+    openai_api_base="https://openrouter.ai/api/v1",
 )
-deepseek_r1 = ChatOpenAI(
-    model="deepseek/deepseek-r1-0528:free",
+stable_fallback = ChatOpenAI(
+    model=os.getenv("OPENROUTER_MODEL_FALLBACK", "z-ai/glm-4.5-air:free"),
     temperature=0,
     streaming=True,
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-    openai_api_base="https://openrouter.ai/api/v1"
+    openai_api_base="https://openrouter.ai/api/v1",
 )
-devstral = ChatOpenAI(
-    model="mistralai/devstral-2512:free",
-    temperature=0,
-    streaming=True,
-    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-    openai_api_base="https://openrouter.ai/api/v1"
-)
-chimera = ChatOpenAI(
-    model="tngtech/deepseek-r1t2-chimera:free",
-    temperature=0,
-    streaming=True,
-    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-    openai_api_base="https://openrouter.ai/api/v1"
-)
-glm_4 = ChatOpenAI(
-    model="z-ai/glm-4.5-air:free",
-    temperature=0,
-    streaming=True,
-    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
-    openai_api_base="https://openrouter.ai/api/v1"
-)
-llm = gpt_3_5.configurable_alternatives(
+llm = stable_primary.configurable_alternatives(
     # This gives this field an id
     # When configuring the end runnable, we can then use this id to configure this field
     ConfigurableField(id="llm"),
-    default_key="xiaomi_mimo_v2_flash",
-    deepseek_r1=deepseek_r1,
-    mistralai_devstral=devstral,
-    deepseek_r1t2_chimera=chimera,
-    glm_4_5_air=glm_4,
-).with_fallbacks(
-    [deepseek_r1, devstral, chimera, glm_4]
+    default_key="stable_primary",
+    stable_fallback=stable_fallback,
+    # backward-compatible keys from old frontend options
+    xiaomi_mimo_v2_flash=stable_primary,
+    deepseek_r1=stable_primary,
+    mistralai_devstral=stable_primary,
+    deepseek_r1t2_chimera=stable_primary,
+    glm_4_5_air=stable_primary,
 )
 
 retriever = get_retriever()
