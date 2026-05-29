@@ -97,6 +97,16 @@ SCRIPT_ACCEPTANCE_KEYWORDS = [
     "开始吧",
     "试试",
     "那就来",
+    "再试一次",
+    "重试",
+]
+
+SCRIPT_CANCEL_KEYWORDS = [
+    "取消",
+    "不用了",
+    "先不",
+    "等会",
+    "换个问题",
 ]
 
 PRACTICE_INVITE_MARKERS = [
@@ -478,6 +488,62 @@ def extract_script_requirements(text: str) -> ScriptRequirements:
     )
 
 
+def merge_script_requirements(*requirements: ScriptRequirements) -> ScriptRequirements:
+    merged = ScriptRequirements()
+    for req in requirements:
+        if req.duration_min is not None:
+            merged.duration_min = req.duration_min
+        if req.where:
+            merged.where = req.where
+        if req.what:
+            merged.what = req.what
+        if req.core_goal:
+            merged.core_goal = req.core_goal
+    return merged
+
+
+def extract_requirements_from_ai_history(chat_history: Optional[List[Dict[str, str]]]) -> ScriptRequirements:
+    req = ScriptRequirements()
+    if not chat_history:
+        return req
+
+    duration_pattern = re.compile(r"时长[:：]\s*(\d{1,3})\s*分钟")
+    where_pattern = re.compile(r"场景[:：]\s*([^；;。]+)")
+    what_pattern = re.compile(r"当下状态[:：]\s*([^；;。]+)")
+    goal_pattern = re.compile(r"核心目的[:：]\s*([^；;。]+)")
+
+    for message in chat_history:
+        ai_text = _safe_strip(message.get("ai"))
+        if not ai_text:
+            continue
+
+        duration_match = duration_pattern.search(ai_text)
+        if duration_match:
+            value = int(duration_match.group(1))
+            if 1 <= value <= 180:
+                req.duration_min = value
+
+        where_match = where_pattern.search(ai_text)
+        if where_match:
+            value = where_match.group(1).strip()
+            if value and value not in ("未确认", "未提供"):
+                req.where = value
+
+        what_match = what_pattern.search(ai_text)
+        if what_match:
+            value = what_match.group(1).strip()
+            if value and value not in ("未确认", "未提供"):
+                req.what = value
+
+        goal_match = goal_pattern.search(ai_text)
+        if goal_match:
+            value = goal_match.group(1).strip()
+            if value and value not in ("未确认", "未提供"):
+                req.core_goal = value
+
+    return req
+
+
 def get_missing_slots(req: ScriptRequirements) -> List[str]:
     missing: List[str] = []
     if req.duration_min is None:
@@ -563,6 +629,13 @@ def is_script_collection_active(chat_history: Optional[List[Dict[str, str]]]) ->
         "需求确认完成，可以进入 Skill2",
         "回复“开始生成脚本”即可",
         "我先确认一个最关键问题",
+        "你希望这段引导语大概多长时间",
+        "你现在是在什么场景里使用",
+        "你当下正在做什么或刚做完什么",
+        "这段冥想最想帮你达成什么",
+        "我暂时没能生成脚本",
+        "正在生成脚本",
+        "收到。",
     ]
     return _contains_any(last_ai, markers)
 
@@ -618,21 +691,14 @@ def format_intervention_message(reason: SafetyReason = "none") -> str:
 
 
 def format_script_followup_message(decision: Skill1Decision) -> str:
-    summary = summarize_requirements(decision.script_requirements)
-    return (
-        "我收到你想生成正念引导语脚本。"
-        f"目前我整理到的信息是：{summary}"
-        f"我先确认一个最关键问题：{decision.next_question}"
-    )
+    if decision.next_question:
+        return f"收到。{decision.next_question}"
+    return "收到。你可以继续补充场景、状态和核心目的。"
 
 
 def format_script_ready_message(decision: Skill1Decision) -> str:
     summary = summarize_requirements(decision.script_requirements)
-    return (
-        "需求确认完成，可以进入 Skill2 生成脚本。"
-        f"{summary}"
-        "如果你确认无误，回复“开始生成脚本”即可。"
-    )
+    return f"需求确认完成，正在生成脚本。{summary}"
 
 
 def decision_from_dict(data: Dict) -> Skill1Decision:
@@ -780,17 +846,22 @@ def coerce_skill1_decision(
     if not isinstance(raw_req, dict):
         raw_req = {}
 
-    fallback_req = extract_script_requirements(merged_text)
+    history_req = extract_script_requirements("\n".join(human_history).lower())
+    ai_history_req = extract_requirements_from_ai_history(history)
+    fallback_req = merge_script_requirements(ai_history_req, history_req, extract_script_requirements(merged_text))
     duration_min = _coerce_duration_minutes(raw_req.get("duration_min"))
     where = _clean_slot_text(raw_req.get("where"))
     what = _clean_slot_text(raw_req.get("what"))
     core_goal = _clean_slot_text(raw_req.get("core_goal"))
 
-    req = ScriptRequirements(
-        duration_min=duration_min if duration_min is not None else fallback_req.duration_min,
-        where=where or fallback_req.where,
-        what=what or fallback_req.what,
-        core_goal=core_goal or fallback_req.core_goal,
+    req = merge_script_requirements(
+        fallback_req,
+        ScriptRequirements(
+            duration_min=duration_min,
+            where=where,
+            what=what,
+            core_goal=core_goal,
+        ),
     )
 
     if route == "script_gen":
@@ -843,7 +914,8 @@ def analyze_skill1(question: str, chat_history: Optional[List[Dict[str, str]]] =
     script_collection_active = is_script_collection_active(history)
     invited_to_practice = did_ai_invite_practice(history)
     current_req = extract_script_requirements(current_text)
-    should_continue_slot_collection = script_collection_active and has_any_script_slot(current_req)
+    cancelled = _contains_any(current_text, SCRIPT_CANCEL_KEYWORDS)
+    should_continue_slot_collection = script_collection_active and not cancelled
     accepted_after_invite = invited_to_practice and is_short_acceptance(current_text)
     script_intent = (
         detect_script_intent(current_text)
@@ -852,7 +924,10 @@ def analyze_skill1(question: str, chat_history: Optional[List[Dict[str, str]]] =
     )
 
     if script_intent:
-        script_requirements = extract_script_requirements(merged_text)
+        history_req = extract_script_requirements("\n".join(human_history).lower())
+        ai_history_req = extract_requirements_from_ai_history(history)
+        current_req_full = extract_script_requirements(merged_text)
+        script_requirements = merge_script_requirements(ai_history_req, history_req, current_req_full)
         missing_slots = get_missing_slots(script_requirements)
         return Skill1Decision(
             route="script_gen",

@@ -8,6 +8,13 @@ from typing import Any, Dict, List, Optional, Sequence
 import weaviate
 from backend.constants import WEAVIATE_DOCS_INDEX_NAME
 from backend.retrieval import HybridWeaviateRetriever, infer_retrieval_filters
+from backend.skill2_policy import (
+    build_block_response,
+    classify_script_mode,
+    evaluate_script_quality,
+    render_validation_feedback,
+    step_char_budgets,
+)
 from backend.skill1 import (
     coerce_skill1_decision,
     decision_from_dict,
@@ -166,24 +173,9 @@ Few-shot 参考（仅用于学习路由，不要复制文本）：
 输出：{"route":"script_gen","risk_level":"low","safety_reason":"none","negative_emotion":false,"state_tags":["body:sleep"],"energy_tags":[],"script_requirements":{"duration_min":null,"where":"睡前","what":null,"core_goal":"放松入睡"}}
 """
 
+# Keep this template for future expansion, but current follow-up uses deterministic short prompts.
 SCRIPT_REQUIREMENT_FOLLOWUP_TEMPLATE = """\
-你是正念练习需求确认助手。你的任务是根据当前槽位状态，向用户提出“一个最关键的问题”，帮助补齐信息。
-
-当前已识别信息：
-- 时长（分钟）：{duration_min}
-- 场景：{where}
-- 当下状态：{what}
-- 核心目的：{core_goal}
-- 缺失槽位：{missing_slots}
-- 状态标签：{state_tags}
-- 能量标签：{energy_tags}
-
-输出要求：
-1) 用中文，只输出给用户看的话，不要解释。
-2) 先用 1 句温柔确认（不超过 20 字），再问 1 个最关键问题。
-3) 一次只问一个槽位，优先顺序：duration_min > where > what > core_goal。
-4) 如果用户明显在倾诉情绪，语气要接纳，不要像表单盘问。
-5) 不要一次问多个问题。\
+deterministic_followup_reserved\
 """
 
 SKILL2_SCRIPT_TEMPLATE = """\
@@ -193,17 +185,27 @@ SKILL2_SCRIPT_TEMPLATE = """\
 1) 只输出脚本文本正文，不要解释、不要标题、不要 JSON。
 2) 语气温和、慢节奏、第二人称（“你”）。
 3) 安全边界：不做医疗诊断，不承诺治愈，不使用绝对化表达。
-4) 结构：
-   - 安顿开场（落地、姿势、呼吸）
-   - 核心引导（贴合用户状态与核心目的）
-   - 收束结束（回到当下、过渡回任务/休息）
-5) 可使用“（停顿3秒）”等停顿提示，便于朗读。
-6) 长度按时长控制：
-   - 3-5 分钟：约 450-700 字
-   - 6-10 分钟：约 700-1200 字
-   - 11-20 分钟：约 1200-1800 字
+4) 必须严格使用以下五个标题并保持顺序：
+   【入境】【觉察】【接纳】【充能】【收束】
+5) 每个标题下都要有可朗读内容，不能空段落。
+6) 可使用“（停顿3秒）”等停顿提示，便于朗读。
+7) 禁止表达：
+   - 清空头脑、丢掉痛苦、忘掉一切
+   - 深入感受、面对痛苦、释放创伤
+   - 治愈/治疗/治好/缓解症状/诊断
+   - 必须/一定要/不许动/不准睁眼
+8) 必须遵守字数预算（来自输入）：总字数范围与各步骤建议字数。
+9) 若提供了 RAG 参考片段，可借鉴其表达方式，但不要逐字复制。\
+"""
 
-若提供了 RAG 参考片段，可借鉴其表达方式，但不要逐字复制。\
+SKILL2_REWRITE_TEMPLATE = """\
+你是脚本质量修正器。请根据“原稿+校验反馈”输出一版修正稿。
+
+硬性要求：
+1) 只输出修正后的脚本正文，不要解释。
+2) 必须保留并按顺序使用五个标题：【入境】【觉察】【接纳】【充能】【收束】。
+3) 严格修复校验反馈指出的问题（时长、安全、个性化）。
+4) 禁止使用禁用表达和医疗化词汇。\
 """
 
 SCRIPT2_START_KEYWORDS = [
@@ -388,11 +390,7 @@ def format_skill1_script_ready_response(payload: Dict) -> str:
 
 
 def should_generate_skill2(payload: Dict) -> bool:
-    if not is_route(payload, "script_gen") or has_missing_script_slots(payload):
-        return False
-    raw_question = str(payload.get("question", "") or "")
-    normalized = re.sub(r"\s+", "", raw_question.lower())
-    return any(keyword in normalized for keyword in SCRIPT2_START_KEYWORDS)
+    return is_route(payload, "script_gen") and not has_missing_script_slots(payload)
 
 
 def apply_retrieval_filters(payload: Dict) -> Dict:
@@ -506,12 +504,15 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
             (
                 "human",
                 "请根据以下信息生成脚本：\n"
+                "- 模式：{script_mode}（full=完整五步；simplify=简化睁眼短呼吸）\n"
                 "- 时长（分钟）：{duration_min}\n"
                 "- 场景：{where}\n"
                 "- 当下状态：{what}\n"
                 "- 核心目的：{core_goal}\n"
                 "- 状态标签：{state_tags}\n"
                 "- 能量标签：{energy_tags}\n\n"
+                "- 总字数目标：约{target_chars_total}字\n"
+                "- 五步字数预算：{step_char_budgets}\n\n"
                 "用户刚刚的确认语：{latest_user_message}\n\n"
                 "RAG可参考片段（可选）：\n{script_context}",
             ),
@@ -528,10 +529,31 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         state_tags = "、".join(decision.state_tags) if decision.state_tags else "无"
         energy_tags = "、".join(decision.energy_tags) if decision.energy_tags else "无"
         latest_user_message = str(payload.get("question", "") or "")
+        history_text = stringify_chat_history(payload.get("chat_history"))
+
+        mode_result = classify_script_mode(
+            question=latest_user_message,
+            where=where,
+            what=what,
+            core_goal=core_goal,
+            chat_history_text=history_text,
+        )
+        script_mode = mode_result.get("mode", "full")
+        mode_reason = mode_result.get("reason", "safe")
+
+        if script_mode == "block":
+            return {
+                "script_mode": "block",
+                "mode_reason": mode_reason,
+                "block_response": build_block_response(mode_reason),
+            }
+
+        budgets = step_char_budgets(duration_min=duration_min, mode=script_mode)
 
         script_query = (
             f"正念引导语 脚本 {duration_min}分钟 "
-            f"场景:{where} 状态:{what} 目标:{core_goal}"
+            f"场景:{where} 状态:{what} 目标:{core_goal} "
+            "入境 觉察 接纳 充能 收束"
         )
         script_docs = []
         try:
@@ -554,6 +576,8 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
         script_context = format_docs(script_docs[:4]) if script_docs else "（无可用参考片段）"
 
         return {
+            "script_mode": script_mode,
+            "mode_reason": mode_reason,
             "duration_min": duration_min,
             "where": where,
             "what": what,
@@ -562,47 +586,79 @@ def create_chain(llm: LanguageModelLike, retriever: BaseRetriever) -> Runnable:
             "energy_tags": energy_tags,
             "latest_user_message": latest_user_message,
             "script_context": script_context,
+            "target_chars_total": sum(budgets.values()),
+            "step_char_budgets": (
+                f"入境≈{budgets['入境']}字；觉察≈{budgets['觉察']}字；接纳≈{budgets['接纳']}字；"
+                f"充能≈{budgets['充能']}字；收束≈{budgets['收束']}字"
+            ),
         }
 
-    skill2_script_chain = (
-        RunnableLambda(build_skill2_prompt_inputs).with_config(run_name="Skill2BuildInput")
-        | skill2_prompt
-        | llm
-        | StrOutputParser()
-    ).with_config(run_name="Skill2GenerateScript")
+    def generate_skill2_with_validation(payload: Dict, config: Optional[Dict] = None) -> str:
+        inputs = build_skill2_prompt_inputs(payload)
+        if inputs.get("script_mode") == "block":
+            return str(inputs.get("block_response", "当前场景不适合进行该练习。"))
 
-    requirement_followup_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", SCRIPT_REQUIREMENT_FOLLOWUP_TEMPLATE),
-            (
-                "human",
-                "请生成下一句补槽追问。",
-            ),
-        ]
+        base_messages = skill2_prompt.format_messages(**inputs)
+        base_response = llm.invoke(base_messages, config=config)
+        script = str(getattr(base_response, "content", "") or "").strip()
+        if not script:
+            return "我暂时没能生成脚本。你愿意我再试一次吗？"
+
+        report = evaluate_script_quality(
+            script=script,
+            duration_min=int(inputs.get("duration_min", 8)),
+            mode=str(inputs.get("script_mode", "full")),
+            where=str(inputs.get("where", "")),
+            what=str(inputs.get("what", "")),
+            core_goal=str(inputs.get("core_goal", "")),
+        )
+        if report.get("pass"):
+            return script
+
+        feedback = render_validation_feedback(report)
+        rewrite_prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", SKILL2_REWRITE_TEMPLATE),
+                (
+                    "human",
+                    "原稿：\n{draft}\n\n校验反馈：\n{feedback}\n\n"
+                    "修订约束：\n"
+                    "- 时长：{duration_min}分钟\n"
+                    "- 模式：{script_mode}\n"
+                    "- 场景：{where}\n"
+                    "- 状态：{what}\n"
+                    "- 核心目的：{core_goal}\n"
+                    "- 总字数目标：约{target_chars_total}字\n"
+                    "- 各步骤字数建议：{step_char_budgets}",
+                ),
+            ]
+        )
+        rewrite_messages = rewrite_prompt.format_messages(
+            draft=script,
+            feedback=feedback,
+            duration_min=inputs.get("duration_min", 8),
+            script_mode=inputs.get("script_mode", "full"),
+            where=inputs.get("where", "未提供"),
+            what=inputs.get("what", "未提供"),
+            core_goal=inputs.get("core_goal", "未提供"),
+            target_chars_total=inputs.get("target_chars_total", 0),
+            step_char_budgets=inputs.get("step_char_budgets", ""),
+        )
+        rewrite_response = llm.invoke(rewrite_messages, config=config)
+        rewritten = str(getattr(rewrite_response, "content", "") or "").strip()
+        return rewritten or script
+
+    skill2_script_chain = RunnableLambda(generate_skill2_with_validation).with_config(
+        run_name="Skill2GenerateWithValidation"
     )
 
-    def build_script_followup_inputs(payload: Dict) -> Dict[str, Any]:
+    def build_script_followup_response(payload: Dict) -> str:
         decision = decision_from_dict(payload.get("skill1", {}))
-        req = decision.script_requirements
-        state_tags = "、".join(decision.state_tags) if decision.state_tags else "无"
-        energy_tags = "、".join(decision.energy_tags) if decision.energy_tags else "无"
-        missing_slots = "、".join(decision.missing_slots) if decision.missing_slots else "无"
-        return {
-            "duration_min": req.duration_min if req.duration_min is not None else "未确认",
-            "where": req.where or "未确认",
-            "what": req.what or "未确认",
-            "core_goal": req.core_goal or "未确认",
-            "missing_slots": missing_slots,
-            "state_tags": state_tags,
-            "energy_tags": energy_tags,
-        }
+        return format_script_followup_message(decision)
 
-    script_followup_chain = (
-        RunnableLambda(build_script_followup_inputs).with_config(run_name="Skill1FollowupBuildInput")
-        | requirement_followup_prompt
-        | llm
-        | StrOutputParser()
-    ).with_config(run_name="Skill1FollowupLLM")
+    script_followup_chain = RunnableLambda(build_script_followup_response).with_config(
+        run_name="Skill1FollowupDeterministic"
+    )
 
     cohere_prompt = ChatPromptTemplate.from_messages(
         [

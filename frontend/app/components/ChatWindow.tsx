@@ -3,7 +3,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { RemoteRunnable } from "@langchain/core/runnables/remote";
-import { applyPatch } from "@langchain/core/utils/json_patch";
 
 import { EmptyState } from "./EmptyState";
 import { ChatMessageBubble, Message } from "./ChatMessageBubble";
@@ -44,6 +43,7 @@ export function ChatWindow(props: { conversationId: string }) {
   const searchParams = useSearchParams();
 
   const messageContainerRef = useRef<HTMLDivElement | null>(null);
+  const sendingRef = useRef(false);
   const [messages, setMessages] = useState<Array<Message>>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -64,11 +64,13 @@ export function ChatWindow(props: { conversationId: string }) {
     if (messageContainerRef.current) {
       messageContainerRef.current.classList.add("grow");
     }
-    if (isLoading) {
+    // Synchronous lock to prevent duplicate sends in the same render frame.
+    if (sendingRef.current || isLoading) {
       return;
     }
-    const messageValue = message ?? input;
+    const messageValue = (message ?? input).trim();
     if (messageValue === "") return;
+    sendingRef.current = true;
     setInput("");
     setMessages((prevMessages) => [
       ...prevMessages,
@@ -76,10 +78,9 @@ export function ChatWindow(props: { conversationId: string }) {
     ]);
     setIsLoading(true);
 
-    let accumulatedMessage = "";
+    let assistantMessage = "";
     let runId: string | undefined = undefined;
     let sources: Source[] | undefined = undefined;
-    let messageIndex: number | null = null;
 
     let renderer = new Renderer();
     renderer.paragraph = (text) => {
@@ -103,16 +104,14 @@ export function ChatWindow(props: { conversationId: string }) {
     };
     marked.setOptions({ renderer });
     try {
-      const sourceStepName = "FindDocs";
-      let streamedResponse: Record<string, any> = {};
       const remoteChain = new RemoteRunnable({
         url: apiBaseUrl + "/chat",
         options: {
-          timeout: 60000,
+          timeout: 180000,
         },
       });
       const llmDisplayName = llm ?? "xiaomi_mimo_v2_flash";
-      const streamLog = await remoteChain.streamLog(
+      const invokeResponse: any = await remoteChain.invoke(
         {
           question: messageValue,
           chat_history: chatHistory,
@@ -127,62 +126,41 @@ export function ChatWindow(props: { conversationId: string }) {
             llm: llmDisplayName,
           },
         },
-        {
-          includeNames: [sourceStepName],
-        },
       );
-      for await (const chunk of streamLog) {
-        streamedResponse = applyPatch(streamedResponse, chunk.ops, undefined, false).newDocument;
-        if (
-          Array.isArray(
-            streamedResponse?.logs?.[sourceStepName]?.final_output?.output,
-          )
-        ) {
-          sources = streamedResponse.logs[
-            sourceStepName
-          ].final_output.output.map((doc: Record<string, any>) => ({
-            url: doc.metadata.source,
-            title: doc.metadata.title,
-          }));
-        }
-        if (streamedResponse.id !== undefined) {
-          runId = streamedResponse.id;
-        }
-        if (Array.isArray(streamedResponse?.streamed_output)) {
-          accumulatedMessage = streamedResponse.streamed_output.join("");
-        }
-        const parsedResult = marked.parse(accumulatedMessage);
 
-        setMessages((prevMessages) => {
-          let newMessages = [...prevMessages];
-          if (
-            messageIndex === null ||
-            newMessages[messageIndex] === undefined
-          ) {
-            messageIndex = newMessages.length;
-            newMessages.push({
-              id: Math.random().toString(),
-              content: parsedResult.trim(),
-              runId: runId,
-              sources: sources,
-              role: "assistant",
-            });
-          } else if (newMessages[messageIndex] !== undefined) {
-            newMessages[messageIndex].content = parsedResult.trim();
-            newMessages[messageIndex].runId = runId;
-            newMessages[messageIndex].sources = sources;
-          }
-          return newMessages;
-        });
+      if (typeof invokeResponse === "string") {
+        assistantMessage = invokeResponse;
+      } else if (invokeResponse && typeof invokeResponse === "object") {
+        if (typeof invokeResponse.output === "string") {
+          assistantMessage = invokeResponse.output;
+        } else if (invokeResponse.output !== undefined) {
+          assistantMessage = JSON.stringify(invokeResponse.output);
+        }
+        runId = invokeResponse?.metadata?.run_id;
       }
+
+      if (!assistantMessage) {
+        assistantMessage = "我暂时没有成功返回内容，请再发一次。";
+      }
+
+      const parsedResult = marked.parse(assistantMessage);
+      setMessages((prevMessages) => [
+        ...prevMessages,
+        {
+          id: Math.random().toString(),
+          content: parsedResult.trim(),
+          runId: runId,
+          sources: sources,
+          role: "assistant",
+        },
+      ]);
+
       setChatHistory((prevChatHistory) => [
         ...prevChatHistory,
-        { human: messageValue, ai: accumulatedMessage },
+        { human: messageValue, ai: assistantMessage },
       ]);
-      setIsLoading(false);
     } catch (e) {
       setMessages((prevMessages) => prevMessages.slice(0, -1));
-      setIsLoading(false);
       setInput(messageValue);
       const isAbort =
         e instanceof Error &&
@@ -190,6 +168,9 @@ export function ChatWindow(props: { conversationId: string }) {
       if (!isAbort) {
         throw e;
       }
+    } finally {
+      setIsLoading(false);
+      sendingRef.current = false;
     }
   };
 
@@ -299,6 +280,12 @@ export function ChatWindow(props: { conversationId: string }) {
           borderColor={"rgb(58, 58, 61)"}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
+            const nativeEvent = e.nativeEvent as KeyboardEvent & {
+              isComposing?: boolean;
+            };
+            if (nativeEvent.isComposing) {
+              return;
+            }
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               sendMessage();
@@ -315,6 +302,7 @@ export function ChatWindow(props: { conversationId: string }) {
             aria-label="Send"
             icon={isLoading ? <Spinner /> : <ArrowUpIcon />}
             type="submit"
+            isDisabled={isLoading || input.trim() === ""}
             onClick={(e) => {
               e.preventDefault();
               sendMessage();
